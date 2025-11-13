@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target-path = "/axi/pcie@1000120000/rp1/i2s@a0000";
+
+        __overlay__ {
+            /*
+             * Make our private compatible the first entry so the kernel
+             * binds this I²S instance to the custom NGT driver.
+             * The original compatible string from the base DT is still
+             * present there as a fallback.
+             */
+            compatible = "netgenetech,dw-i2s-ngt";
+            status = "okay";
+        };
+    };
+};
