@@ -92,7 +92,7 @@ static u32 ngt_last_rx_data;
  * That usually means the "interesting" byte is in bits [23:16].
  * Default shift=16 extracts that byte. If needed try 24, 8, or 0.
  */
-static unsigned int ngt_alaw_shift = 8;
+static unsigned int ngt_alaw_shift = 24;  /* NGT: FPGA puts A-law in MSB [31:24] */
 module_param(ngt_alaw_shift, uint, 0644);
 MODULE_PARM_DESC(ngt_alaw_shift, "NGT: which byte inside 32-bit RX word holds A-law (0/8/16/24)");
 
@@ -221,17 +221,23 @@ static void ngt_fifo_pop_rx(struct dw_i2s_dev *dev)
         ngt_last_rx_data = R;
         ngt_pd->rx_cnt++;
 		if (ngt_logged_rx < ngt_log_first) {
-			u8 Lb3 = (L >> 24) & 0xff, Lb2 = (L >> 16) & 0xff, Lb1 = (L >> 8) & 0xff, Lb0 = L & 0xff;
-			u8 Rb3 = (R >> 24) & 0xff, Rb2 = (R >> 16) & 0xff, Rb1 = (R >> 8) & 0xff, Rb0 = R & 0xff;
+			/* Show all 4 byte positions to help identify correct A-law location */
+			u8 Lb3 = (L >> 24) & 0xff, Lb2 = (L >> 16) & 0xff;
+			u8 Lb1 = (L >> 8) & 0xff,  Lb0 = L & 0xff;
+			u8 Rb3 = (R >> 24) & 0xff, Rb2 = (R >> 16) & 0xff;
+			u8 Rb1 = (R >> 8) & 0xff,  Rb0 = R & 0xff;
 
+			/* Decode A-law from the configured shift position */
 			u8 alL = (L >> ngt_alaw_shift) & 0xff;
 			u8 alR = (R >> ngt_alaw_shift) & 0xff;
-
 			s16 pcmL = ngt_alaw_to_pcm16(alL);
 			s16 pcmR = ngt_alaw_to_pcm16(alR);
 
+			/* Also show what PCM would be from each byte position */
 			dev_info(dev->dev,
-				"NGT_RX[%llu] raw L=0x%08x R=0x%08x | bytes L=%02x %02x %02x %02x R=%02x %02x %02x %02x | ALAW(shift=%u) L=0x%02x R=0x%02x | PCM L=%6d R=%6d\n",
+				"NGT_RX[%llu] L=0x%04x R=0x%04x | "
+				"Lb[3:0]=%02x,%02x,%02x,%02x Rb=%02x,%02x,%02x,%02x | "
+				"ALAW@%u: L=0x%02x R=0x%02x | PCM L=%6d R=%6d\n",
 				(unsigned long long)(ngt_pd->rx_cnt - 1),
 				L, R,
 				Lb3, Lb2, Lb1, Lb0,
@@ -270,7 +276,7 @@ static inline void i2s_disable_channels(struct dw_i2s_dev *dev, u32 stream)
 	}
 }
 #else
-static inline void i2s_disable_channels(struct dw_i2s_dev *dev, u32 stream){ 
+static inline void i2s_disable_channels(struct dw_i2s_dev *dev, u32 stream){
     /* no-op in poll-only builds */
 }
 #endif /* NGT_DISABLE_CHANNELS */
@@ -440,11 +446,14 @@ static void dw_i2s_config(struct dw_i2s_dev *dev, int stream)
 
 	/* =====================================================
 	 * NGT HARD LOCK — FPGA EXPECTATION
+	 * 8kHz, 8-bit A-law packed into I2S frames
+	 * Try 16-bit resolution (0x02) - the I2S controller will
+	 * right-justify incoming data within the 16-bit word
 	 * ===================================================== */
 	config->sample_rate   = 8000;
 	config->chan_nr       = 2;
-	config->data_width    = 32;
-	dev->xfer_resolution  = 0x05;   /* 16-bit */
+	config->data_width    = 16;          /* Changed from 32 to 16 */
+	dev->xfer_resolution  = 0x02;        /* 16-bit resolution (was 0x05=32-bit) */
 
 	dev_dbg(dev->dev,
 		"NGT: dw_i2s_config stream=%s rate=%d width=%d ch=%d\n",
@@ -574,13 +583,13 @@ static int dw_i2s_hw_params(struct snd_pcm_substream *substream,
 		break;
 	case SNDRV_PCM_FORMAT_S24_LE:
 		config->data_width = 24;
-		dma_data->dt.addr_width = 4;
+		dma_data->dt.addr_width = 2;
 		dev->xfer_resolution = 0x04;
 		break;
 	case SNDRV_PCM_FORMAT_S32_LE:
 		config->data_width = 32;
-		dma_data->dt.addr_width = 4;
-		dev->xfer_resolution = 0x05;
+		dma_data->dt.addr_width = 2;
+		dev->xfer_resolution = 0x02;
 		break;
 	default:
 		dev_err(dev->dev, "designware-i2s: unsupported PCM fmt");
@@ -661,10 +670,10 @@ static int dw_i2s_hw_params(struct snd_pcm_substream *substream,
 	/* Lock config to FPGA expectation */
 	config->sample_rate = 8000;
 	config->chan_nr     = 2;
-	config->data_width  = 32;
-	dev->xfer_resolution = 0x05;
+	config->data_width  = 16;         /* 16-bit frames for 8-bit A-law */
+	dev->xfer_resolution = 0x02;      /* 16-bit resolution */
 
-	dma_data->dt.addr_width = 4;
+	dma_data->dt.addr_width = 2;      /* 2 bytes = 16 bits */
 
 	dev_dbg(dev->dev, "NGT: FINAL config: rate=%d, width=%d, channels=%d\n",
 	         config->sample_rate, config->data_width, config->chan_nr);
@@ -963,7 +972,7 @@ static const struct snd_soc_component_driver dw_i2s_component = {
 
 # if 1
 
-// Width of (DMA) bus 
+// Width of (DMA) bus
 static const u32 bus_widths[COMP_MAX_DATA_WIDTH] = {
 	DMA_SLAVE_BUSWIDTH_1_BYTE,
 	DMA_SLAVE_BUSWIDTH_2_BYTES,
@@ -987,7 +996,7 @@ static int dw_configure_dai(struct dw_i2s_dev *dev,
 				   struct snd_soc_dai_driver *dw_i2s_dai,
 				   unsigned int rates)
 {
-	
+
 	 /* Read component parameter registers to extract
 	 *the I2S block's configuration.
 	 */
@@ -1496,9 +1505,9 @@ static int dw_i2s_probe(struct platform_device *pdev)
 	if (ngt_use_poll && ngt_autostart) {
 		/* Hard lock expected stream settings */
 		dev->config.sample_rate = 8000;
-		dev->config.data_width  = 32;
+		dev->config.data_width  = 16;      /* Match FPGA: 8-bit A-law in 16-bit frames */
 		dev->config.chan_nr     = 2;
-		dev->xfer_resolution    = 0x05;
+		dev->xfer_resolution    = 0x02;    /* 16-bit resolution */
 
 		/* ---- clean stop before touching FIFOs/config ---- */
 		i2s_write_reg(dev->i2s_base, CER, 0);
@@ -1514,10 +1523,10 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		dw_i2s_config(dev, SNDRV_PCM_STREAM_PLAYBACK);
 		dw_i2s_config(dev, SNDRV_PCM_STREAM_CAPTURE);
 
-		/* Force 32-bit width at the controller (redundant but explicit) */
-		i2s_write_reg(dev->i2s_base, TCR(0), 0x05);
-		i2s_write_reg(dev->i2s_base, RCR(0), 0x05);
-		i2s_write_reg(dev->i2s_base, RFCR(0), 0x07); // Trigger FIFO on both channels
+		/* Force 16-bit width at the controller to match FPGA A-law */
+		i2s_write_reg(dev->i2s_base, TCR(0), 0x02);  /* 16-bit TX */
+		i2s_write_reg(dev->i2s_base, RCR(0), 0x02);  /* 16-bit RX */
+		i2s_write_reg(dev->i2s_base, RFCR(0), 0x07); /* Trigger FIFO on both channels */
 
 		/* Enable I2S core + blocks */
 		i2s_write_reg(dev->i2s_base, IER, IER_IEN); /* global enable */
@@ -1535,6 +1544,21 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		ngt_pd->running = true;
 		hrtimer_start(&ngt_pd->timer, ngt_pd->period, HRTIMER_MODE_REL_PINNED);
 		dev_info(dev->dev, "NGT: autostart done, polling started (%u us)\n", ngt_poll_us);
+
+		/* Dump registers for debugging */
+		dev_info(dev->dev, "NGT: REG DUMP after autostart:\n");
+		dev_info(dev->dev, "  IER=0x%08x CER=0x%08x ITER=0x%08x IRER=0x%08x\n",
+			i2s_read_reg(dev->i2s_base, IER),
+			i2s_read_reg(dev->i2s_base, CER),
+			i2s_read_reg(dev->i2s_base, ITER),
+			i2s_read_reg(dev->i2s_base, IRER));
+		dev_info(dev->dev, "  TCR0=0x%08x RCR0=0x%08x CCR=0x%08x\n",
+			i2s_read_reg(dev->i2s_base, TCR(0)),
+			i2s_read_reg(dev->i2s_base, RCR(0)),
+			i2s_read_reg(dev->i2s_base, CCR));
+		dev_info(dev->dev, "  TFCR0=0x%08x RFCR0=0x%08x\n",
+			i2s_read_reg(dev->i2s_base, TFCR(0)),
+			i2s_read_reg(dev->i2s_base, RFCR(0)));
 	}
 
 	return 0;
