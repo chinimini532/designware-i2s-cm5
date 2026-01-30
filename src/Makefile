@@ -15,7 +15,7 @@ CROSS_COMPILE ?= aarch64-linux-gnu-
 
 # Build one module from two objects
 obj-m += designware-i2s-NGT.o
-designware-i2s-NGT-objs := dwc-i2s-ngt.o dwc-pcm.o
+designware-i2s-NGT-objs := dwc-i2s-ngt.o  dwc-pcm.o
 
 # Detect the kernel *source* dir even if kernel was built with O=<outdir>
 # Pure Make conditionals (portable with /bin/sh)

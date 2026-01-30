@@ -1,0 +1,129 @@
+make -C /home/chinimini/linux ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+	M=/home/chinimini/designware-i2s-ngt/src modules
+make[1]: Entering directory '/home/chinimini/linux'
+make --no-print-directory -C /home/chinimini/linux \
+-f /home/chinimini/linux/Makefile modules
+make -f ./scripts/Makefile.build obj=/home/chinimini/designware-i2s-ngt/src need-builtin=1 need-modorder=1 
+# cmd_mod /home/chinimini/designware-i2s-ngt/src/designware-i2s-NGT.mod
+  printf '%s
+'   dwc-i2s-ngt.o dwc-pcm.o | awk '!x[$0]++ { print("/home/chinimini/designware-i2s-ngt/src/"$0) }' > /home/chinimini/designware-i2s-ngt/src/designware-i2s-NGT.mod
+# CC [M]  /home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.o
+  aarch64-linux-gnu-gcc -Wp,-MMD,/home/chinimini/designware-i2s-ngt/src/.dwc-i2s-ngt.o.d -nostdinc -I./arch/arm64/include -I./arch/arm64/include/generated  -I./include -I./arch/arm64/include/uapi -I./arch/arm64/include/generated/uapi -I./include/uapi -I./include/generated/uapi -include ./include/linux/compiler-version.h -include ./include/linux/kconfig.h -include ./include/linux/compiler_types.h -D__KERNEL__ -mlittle-endian -DCC_USING_PATCHABLE_FUNCTION_ENTRY -DKASAN_SHADOW_SCALE_SHIFT= -fmacro-prefix-map=./= -std=gnu11 -fshort-wchar -funsigned-char -fno-common -fno-PIE -fno-strict-aliasing -mgeneral-regs-only -DCONFIG_CC_HAS_K_CONSTRAINT=1 -Wno-psabi -mabi=lp64 -fno-asynchronous-unwind-tables -fno-unwind-tables -mbranch-protection=pac-ret -Wa,-march=armv8.5-a -DARM64_ASM_ARCH='"armv8.5-a"' -DKASAN_SHADOW_SCALE_SHIFT= -fno-delete-null-pointer-checks -O2 -fno-allow-store-data-races -fstack-protector-strong -fno-omit-frame-pointer -fno-optimize-sibling-calls -ftrivial-auto-var-init=zero -fno-stack-clash-protection -fpatchable-function-entry=4,2 -falign-functions=8 -fstrict-flex-arrays=3 -fno-strict-overflow -fno-stack-check -fconserve-stack -fno-builtin-wcslen -fno-builtin-wcslen -Wall -Wextra -Wundef -Werror=implicit-function-declaration -Werror=implicit-int -Werror=return-type -Werror=strict-prototypes -Wno-format-security -Wno-trigraphs -Wno-frame-address -Wno-address-of-packed-member -Wmissing-declarations -Wmissing-prototypes -Wframe-larger-than=2048 -Wno-main -Wno-dangling-pointer -Wvla -Wno-pointer-sign -Wcast-function-type -Wno-array-bounds -Wno-stringop-overflow -Wno-alloc-size-larger-than -Wimplicit-fallthrough=5 -Werror=date-time -Werror=incompatible-pointer-types -Werror=designated-init -Wenum-conversion -Wunused -Wno-unused-but-set-variable -Wno-unused-const-variable -Wno-packed-not-aligned -Wno-format-overflow -Wno-format-truncation -Wno-stringop-truncation -Wno-override-init -Wno-missing-field-initializers -Wno-type-limits -Wno-shift-negative-value -Wno-maybe-uninitialized -Wno-sign-compare -Wno-unused-parameter -mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=1424 -I/home/chinimini/linux/sound/soc/dwc  -DMODULE  -DKBUILD_BASENAME='"dwc_i2s_ngt"' -DKBUILD_MODNAME='"designware_i2s_NGT"' -D__KBUILD_MODNAME=kmod_designware_i2s_NGT -c -o /home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.o /home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c  
+In file included from ./include/linux/device.h:15,
+                 from /home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:15:
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c: In function ‘dw_i2s_probe’:
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:18: warning: format ‘%u’ expects argument of type ‘unsigned int’, but argument 3 has type ‘long unsigned int’ [-Wformat=]
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/linux/dev_printk.h:110:30: note: in definition of macro ‘dev_printk_index_wrap’
+  110 |                 _p_func(dev, fmt, ##__VA_ARGS__);                       \
+      |                              ^~~
+./include/linux/dev_printk.h:160:58: note: in expansion of macro ‘dev_fmt’
+  160 |         dev_printk_index_wrap(_dev_info, KERN_INFO, dev, dev_fmt(fmt), ##__VA_ARGS__)
+      |                                                          ^~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1119:9: note: in expansion of macro ‘dev_info’
+ 1119 |         dev_info(dev->dev,
+      |         ^~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:38: note: format string is defined here
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                                     ~^
+      |                                      |
+      |                                      unsigned int
+      |                                     %lu
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:18: warning: format ‘%u’ expects argument of type ‘unsigned int’, but argument 4 has type ‘long unsigned int’ [-Wformat=]
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/linux/dev_printk.h:110:30: note: in definition of macro ‘dev_printk_index_wrap’
+  110 |                 _p_func(dev, fmt, ##__VA_ARGS__);                       \
+      |                              ^~~
+./include/linux/dev_printk.h:160:58: note: in expansion of macro ‘dev_fmt’
+  160 |         dev_printk_index_wrap(_dev_info, KERN_INFO, dev, dev_fmt(fmt), ##__VA_ARGS__)
+      |                                                          ^~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1119:9: note: in expansion of macro ‘dev_info’
+ 1119 |         dev_info(dev->dev,
+      |         ^~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:47: note: format string is defined here
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                                              ~^
+      |                                               |
+      |                                               unsigned int
+      |                                              %lu
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:18: warning: format ‘%u’ expects argument of type ‘unsigned int’, but argument 5 has type ‘long unsigned int’ [-Wformat=]
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/linux/dev_printk.h:110:30: note: in definition of macro ‘dev_printk_index_wrap’
+  110 |                 _p_func(dev, fmt, ##__VA_ARGS__);                       \
+      |                              ^~~
+./include/linux/dev_printk.h:160:58: note: in expansion of macro ‘dev_fmt’
+  160 |         dev_printk_index_wrap(_dev_info, KERN_INFO, dev, dev_fmt(fmt), ##__VA_ARGS__)
+      |                                                          ^~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1119:9: note: in expansion of macro ‘dev_info’
+ 1119 |         dev_info(dev->dev,
+      |         ^~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:56: note: format string is defined here
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                                                       ~^
+      |                                                        |
+      |                                                        unsigned int
+      |                                                       %lu
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:18: warning: format ‘%u’ expects argument of type ‘unsigned int’, but argument 6 has type ‘long unsigned int’ [-Wformat=]
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/linux/dev_printk.h:110:30: note: in definition of macro ‘dev_printk_index_wrap’
+  110 |                 _p_func(dev, fmt, ##__VA_ARGS__);                       \
+      |                              ^~~
+./include/linux/dev_printk.h:160:58: note: in expansion of macro ‘dev_fmt’
+  160 |         dev_printk_index_wrap(_dev_info, KERN_INFO, dev, dev_fmt(fmt), ##__VA_ARGS__)
+      |                                                          ^~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1119:9: note: in expansion of macro ‘dev_info’
+ 1119 |         dev_info(dev->dev,
+      |         ^~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:65: note: format string is defined here
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                                                                ~^
+      |                                                                 |
+      |                                                                 unsigned int
+      |                                                                %lu
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:18: warning: format ‘%u’ expects argument of type ‘unsigned int’, but argument 7 has type ‘long unsigned int’ [-Wformat=]
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./include/linux/dev_printk.h:110:30: note: in definition of macro ‘dev_printk_index_wrap’
+  110 |                 _p_func(dev, fmt, ##__VA_ARGS__);                       \
+      |                              ^~~
+./include/linux/dev_printk.h:160:58: note: in expansion of macro ‘dev_fmt’
+  160 |         dev_printk_index_wrap(_dev_info, KERN_INFO, dev, dev_fmt(fmt), ##__VA_ARGS__)
+      |                                                          ^~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1119:9: note: in expansion of macro ‘dev_info’
+ 1119 |         dev_info(dev->dev,
+      |         ^~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1120:74: note: format string is defined here
+ 1120 |                  "NGT: CAPS MODE_EN=%u TX_EN=%u RX_EN=%u TX_CH=%u RX_CH=%u\n",
+      |                                                                         ~^
+      |                                                                          |
+      |                                                                          unsigned int
+      |                                                                         %lu
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c: At top level:
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1279:18: error: ‘dw_i2s_cfg’ undeclared here (not in a function); did you mean ‘dw_i2s_config’?
+ 1279 |         .data = &dw_i2s_cfg,
+      |                  ^~~~~~~~~~
+      |                  dw_i2s_config
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1044:12: warning: ‘jh7110_i2stx0_clk_cfg’ defined but not used [-Wunused-function]
+ 1044 | static int jh7110_i2stx0_clk_cfg(struct i2s_clk_config_data *config)
+      |            ^~~~~~~~~~~~~~~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:1027:12: warning: ‘jh7110_i2srx_crg_init’ defined but not used [-Wunused-function]
+ 1027 | static int jh7110_i2srx_crg_init(struct dw_i2s_dev *dev)
+      |            ^~~~~~~~~~~~~~~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:869:12: warning: ‘jh7110_i2s_crg_master_init’ defined but not used [-Wunused-function]
+  869 | static int jh7110_i2s_crg_master_init(struct dw_i2s_dev *dev)
+      |            ^~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:796:12: warning: ‘dw_i2s_resume’ defined but not used [-Wunused-function]
+  796 | static int dw_i2s_resume(struct snd_soc_component *component)
+      |            ^~~~~~~~~~~~~
+/home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.c:787:12: warning: ‘dw_i2s_suspend’ defined but not used [-Wunused-function]
+  787 | static int dw_i2s_suspend(struct snd_soc_component *component)
+      |            ^~~~~~~~~~~~~~
+make[3]: *** [scripts/Makefile.build:244: /home/chinimini/designware-i2s-ngt/src/dwc-i2s-ngt.o] Error 1
+make[2]: *** [/home/chinimini/linux/Makefile:1945: /home/chinimini/designware-i2s-ngt/src] Error 2
+make[1]: *** [Makefile:224: __sub-make] Error 2
+make[1]: Leaving directory '/home/chinimini/linux'
+make: *** [Makefile:39: all] Error 2
