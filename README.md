@@ -1,3 +1,4 @@
+
 # designware-i2s-ngt
 
 This repository contains experimental work on a customized Synopsys DesignWare I²S
@@ -87,3 +88,5 @@ same license.
 
 
 
+=======
+# designware-i2s-cm5
