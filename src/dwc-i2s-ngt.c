@@ -1,12 +1,13 @@
 /*
- * ALSA SoC Synopsys I2S Audio Layer - NGT Test Version
+ * ALSA SoC Synopsys I2S Audio Layer - NGT MASTER MODE
  *
- * This version includes configurable parameters for testing different
- * I2S/TDM modes without recompiling.
+ * This version configures Pi as I2S MASTER for loopback testing.
+ * Pi generates BCLK, FS, and sends data on DOUT.
+ * FPGA loops DOUT back to DIN.
  *
  * Based on sound/soc/dwc/designware_i2s.c
  * Copyright (C) 2010 ST Microelectronics
- * Modified by NGT for FPGA A-law audio testing
+ * Modified by NGT for FPGA loopback testing
  */
 
 #include <linux/clk.h>
@@ -29,16 +30,11 @@
 #include <linux/platform_device.h>
 #include <linux/bitops.h>
 
-/* Upstream-style width table reused for DMA FIFO sizing */
-static const u32 ngt_fifo_width[COMP_MAX_WORDSIZE] = { 12, 16, 20, 24, 32, 0, 0, 0 };
-
 /* Forward declarations */
 int dw_pcm_register(struct platform_device *pdev);
-void dw_pcm_push_tx(struct dw_i2s_dev *dev);
-void dw_pcm_pop_rx(struct dw_i2s_dev *dev);
 
 /* =====================================================
- * MODULE PARAMETERS - Basic polling control
+ * MODULE PARAMETERS
  * ===================================================== */
 
 static bool ngt_use_poll = true;
@@ -47,15 +43,11 @@ MODULE_PARM_DESC(ngt_use_poll, "NGT: enable hrtimer polling path");
 
 static unsigned int ngt_poll_us = 125;
 module_param(ngt_poll_us, uint, 0644);
-MODULE_PARM_DESC(ngt_poll_us, "NGT: poll period in microseconds");
+MODULE_PARM_DESC(ngt_poll_us, "NGT: poll period in microseconds (125us = 8kHz)");
 
 static bool ngt_autostart = true;
 module_param(ngt_autostart, bool, 0644);
-MODULE_PARM_DESC(ngt_autostart, "NGT: autostart poller at probe time");
-
-static unsigned int ngt_log_every = 100;
-module_param(ngt_log_every, uint, 0644);
-MODULE_PARM_DESC(ngt_log_every, "NGT: log ISR snapshot every N polls");
+MODULE_PARM_DESC(ngt_autostart, "NGT: autostart at probe time");
 
 static unsigned int ngt_log_first = 50;
 module_param(ngt_log_first, uint, 0644);
@@ -63,60 +55,33 @@ MODULE_PARM_DESC(ngt_log_first, "NGT: count of initial samples to print");
 
 static unsigned int ngt_fifo_burst = 8;
 module_param(ngt_fifo_burst, uint, 0644);
-MODULE_PARM_DESC(ngt_fifo_burst, "NGT: max words per poll per direction");
+MODULE_PARM_DESC(ngt_fifo_burst, "NGT: max words per poll");
 
-static bool ngt_loop_rx_to_tx = false;
-module_param(ngt_loop_rx_to_tx, bool, 0644);
-MODULE_PARM_DESC(ngt_loop_rx_to_tx, "NGT: copy the last RX word into TX FIFO");
-
-static bool ngt_swap_channels = false;
-module_param(ngt_swap_channels, bool, 0644);
-MODULE_PARM_DESC(ngt_swap_channels, "NGT: swap left and right channels");
-
-static unsigned int ngt_alaw_shift = 8;
-module_param(ngt_alaw_shift, uint, 0644);
-MODULE_PARM_DESC(ngt_alaw_shift, "NGT: bit shift to extract A-law byte (0/8/16/24)");
-
-/* =====================================================
- * MODULE PARAMETERS - I2S FORMAT TESTING
- * These allow testing different modes without recompiling!
- * ===================================================== */
-
-/* Resolution register value:
- * 0x00 = 12-bit (ignore clock)
- * 0x01 = 16-bit
- * 0x02 = 20-bit
- * 0x03 = 24-bit
- * 0x04 = 32-bit
- */
 static unsigned int ngt_resolution = 0x02;
 module_param(ngt_resolution, uint, 0644);
 MODULE_PARM_DESC(ngt_resolution, "NGT: resolution (0x01=16b, 0x02=20b, 0x03=24b, 0x04=32b)");
 
-/* Frame offset: 0=left-justified, 1=I2S standard (1-bit delay) */
-static unsigned int ngt_frame_offset = 1;
-module_param(ngt_frame_offset, uint, 0644);
-MODULE_PARM_DESC(ngt_frame_offset, "NGT: frame offset (0=left-justified, 1=I2S standard)");
+/* Test pattern to send */
+static unsigned int ngt_tx_pattern = 0xD5;
+module_param(ngt_tx_pattern, uint, 0644);
+MODULE_PARM_DESC(ngt_tx_pattern, "NGT: TX test pattern byte (default 0xD5)");
 
-/* TDM mode enable */
-static bool ngt_tdm_enable = false;
-module_param(ngt_tdm_enable, bool, 0644);
-MODULE_PARM_DESC(ngt_tdm_enable, "NGT: enable TDM mode");
+/* CCR value for master mode clock configuration
+ * Bits [2:0] = SCLKG (clock gating cycles)
+ * Bits [4:3] = WSS (word select size: 0=16, 1=24, 2=32 SCLK cycles)
+ *
+ * For 8kHz sample rate with various BCLK rates:
+ * - 16-bit stereo: BCLK = 8000 * 16 * 2 = 256 kHz
+ * - 32-bit stereo: BCLK = 8000 * 32 * 2 = 512 kHz
+ */
+static int ngt_ccr_value = 0x00;
+module_param(ngt_ccr_value, int, 0644);
+MODULE_PARM_DESC(ngt_ccr_value, "NGT: CCR register value for clock config");
 
-/* TDM slots: 2, 4, 8, or 16 */
-static unsigned int ngt_tdm_slots = 2;
-module_param(ngt_tdm_slots, uint, 0644);
-MODULE_PARM_DESC(ngt_tdm_slots, "NGT: TDM slot count (2/4/8/16)");
-
-/* Show full 32-bit raw values regardless of resolution */
-static bool ngt_show_raw32 = true;
-module_param(ngt_show_raw32, bool, 0644);
-MODULE_PARM_DESC(ngt_show_raw32, "NGT: show full 32-bit raw register values");
-
-/* CCR (Clock Configuration Register) override - for testing clock modes */
-static int ngt_ccr_override = -1;  /* -1 = don't override */
-module_param(ngt_ccr_override, int, 0644);
-MODULE_PARM_DESC(ngt_ccr_override, "NGT: CCR register override (-1=auto, 0-7=manual)");
+/* WSS (Word Select Size) */
+static unsigned int ngt_wss = 0;
+module_param(ngt_wss, uint, 0644);
+MODULE_PARM_DESC(ngt_wss, "NGT: Word Select Size (0=16cyc, 1=24cyc, 2=32cyc)");
 
 /* =====================================================
  * Polling state
@@ -125,30 +90,19 @@ struct ngt_poll_data {
     struct hrtimer timer;
     ktime_t period;
     struct dw_i2s_dev *dev;
-    u64 polls, rx_cnt, tx_cnt;
+    u64 polls;
+    u64 tx_cnt;
+    u64 rx_cnt;
+    u64 match_cnt;
+    u64 mismatch_cnt;
     bool running;
 };
 
 static struct ngt_poll_data *ngt_pd;
-static u64 ngt_logged_tx;
 static u64 ngt_logged_rx;
-static u32 ngt_last_tx_data;
-static u32 ngt_last_rx_data;
-
-/* =====================================================
- * G.711 A-law -> signed PCM16 conversion
- * ===================================================== */
-static inline s16 ngt_alaw_to_pcm16(u8 a)
-{
-    a ^= 0x55;
-    int sign = a & 0x80;
-    int exponent = (a >> 4) & 0x07;
-    int mantissa = a & 0x0F;
-    int sample = mantissa << 4;
-    if (exponent)
-        sample = (sample + 0x100) << (exponent - 1);
-    return sign ? sample : -sample;
-}
+static u64 ngt_logged_tx;
+static u32 ngt_last_tx_left;
+static u32 ngt_last_tx_right;
 
 /* =====================================================
  * Register access helpers
@@ -161,139 +115,6 @@ static inline void i2s_write_reg(void __iomem *io_base, int reg, u32 val)
 static inline u32 i2s_read_reg(void __iomem *io_base, int reg)
 {
     return readl(io_base + reg);
-}
-
-/* =====================================================
- * Pattern detection - look for D5 and other patterns
- * ===================================================== */
-static int ngt_d5_count = 0;
-static int ngt_ff_count = 0;
-
-static void ngt_check_patterns(struct dw_i2s_dev *dev, u32 rawL, u32 rawR, u8 aL, u8 aR)
-{
-    /* Check all bytes for D5 pattern */
-    u8 bytes[8] = {
-        rawL & 0xFF, (rawL >> 8) & 0xFF, (rawL >> 16) & 0xFF, (rawL >> 24) & 0xFF,
-        rawR & 0xFF, (rawR >> 8) & 0xFF, (rawR >> 16) & 0xFF, (rawR >> 24) & 0xFF
-    };
-
-    for (int i = 0; i < 8; i++) {
-        if (bytes[i] == 0xD5) {
-            ngt_d5_count++;
-            if (ngt_d5_count <= 5) {
-                dev_info(dev->dev, "NGT: *** FOUND D5 at byte[%d]! *** rawL=0x%08x rawR=0x%08x\n",
-                        i, rawL, rawR);
-            }
-        }
-    }
-
-    /* Also check extracted A-law values */
-    if (aL == 0xD5 || aR == 0xD5) {
-        ngt_d5_count++;
-        if (ngt_d5_count <= 5) {
-            dev_info(dev->dev, "NGT: *** D5 in A-law! *** L=0x%02x R=0x%02x\n", aL, aR);
-        }
-    }
-}
-
-/* =====================================================
- * FIFO operations
- * ===================================================== */
-static void ngt_fifo_push_tx(struct dw_i2s_dev *dev)
-{
-    if (unlikely(!ngt_pd))
-        return;
-
-    unsigned int burst = ngt_fifo_burst;
-    while (burst--) {
-        u32 width = dev->config.data_width ? dev->config.data_width : 16;
-        if (width > 32) width = 32;
-        u32 mask = (width == 32) ? 0xFFFFFFFFu : (BIT(width) - 1);
-        u32 sample;
-
-        if (ngt_loop_rx_to_tx) {
-            sample = ngt_last_rx_data & mask;
-        } else {
-            sample = (u32)(ngt_pd->tx_cnt & mask);
-        }
-
-        i2s_write_reg(dev->i2s_base, LRBR_LTHR(0), sample);
-        i2s_write_reg(dev->i2s_base, RRBR_RTHR(0), sample);
-
-        ngt_last_tx_data = sample;
-        ngt_pd->tx_cnt++;
-    }
-}
-
-static void ngt_fifo_pop_rx(struct dw_i2s_dev *dev)
-{
-    if (unlikely(!ngt_pd))
-        return;
-
-    unsigned int burst = ngt_fifo_burst;
-    u32 isr0 = i2s_read_reg(dev->i2s_base, ISR(0));
-
-    if (!(isr0 & (ISR_RXDA | ISR_RXFO)))
-        return;
-
-    while (burst--) {
-        u32 rawL, rawR;
-
-        /* Read raw 32-bit values from FIFOs */
-        rawL = i2s_read_reg(dev->i2s_base, LRBR_LTHR(0));
-        rawR = i2s_read_reg(dev->i2s_base, RRBR_RTHR(0));
-
-        /* Optional channel swap */
-        u32 L, R;
-        if (ngt_swap_channels) {
-            L = rawR;
-            R = rawL;
-        } else {
-            L = rawL;
-            R = rawR;
-        }
-
-        /* Extract A-law byte based on shift parameter */
-        u8 aL = (L >> ngt_alaw_shift) & 0xFF;
-        u8 aR = (R >> ngt_alaw_shift) & 0xFF;
-
-        /* Check for D5 pattern in ALL byte positions */
-        ngt_check_patterns(dev, rawL, rawR, aL, aR);
-
-        /* Convert A-law to PCM */
-        s16 pcmL = ngt_alaw_to_pcm16(aL);
-        s16 pcmR = ngt_alaw_to_pcm16(aR);
-
-        ngt_last_rx_data = R;
-        ngt_pd->rx_cnt++;
-
-        /* Logging */
-        if (ngt_logged_rx < ngt_log_first) {
-            if (ngt_show_raw32) {
-                dev_info(dev->dev,
-                    "NGT_RX[%llu] RAW: L=0x%08x R=0x%08x | "
-                    "bytes L[3:0]=%02x,%02x,%02x,%02x R[3:0]=%02x,%02x,%02x,%02x | "
-                    "A-law@%u: L=0x%02x R=0x%02x | PCM: L=%6d R=%6d\n",
-                    (unsigned long long)(ngt_pd->rx_cnt - 1),
-                    rawL, rawR,
-                    (rawL >> 24) & 0xFF, (rawL >> 16) & 0xFF, (rawL >> 8) & 0xFF, rawL & 0xFF,
-                    (rawR >> 24) & 0xFF, (rawR >> 16) & 0xFF, (rawR >> 8) & 0xFF, rawR & 0xFF,
-                    ngt_alaw_shift, aL, aR,
-                    pcmL, pcmR);
-            } else {
-                dev_info(dev->dev,
-                    "NGT_RX[%llu] A-law: L=0x%02x->PCM=%6d, R=0x%02x->PCM=%6d\n",
-                    (unsigned long long)(ngt_pd->rx_cnt - 1),
-                    aL, pcmL, aR, pcmR);
-            }
-            ngt_logged_rx++;
-        }
-
-        i2s_read_reg(dev->i2s_base, ROR(0)); /* clear RX overrun */
-        isr0 = i2s_read_reg(dev->i2s_base, ISR(0));
-        if (!(isr0 & (ISR_RXDA | ISR_RXFO)))
-            break;
-    }
 }
 
 /* =====================================================
@@ -324,7 +145,128 @@ static inline void i2s_clear_irqs(struct dw_i2s_dev *dev, u32 stream)
 }
 
 /* =====================================================
- * HR-timer poll callback
+ * TX: Push test pattern to FIFO
+ * ===================================================== */
+static void ngt_fifo_push_tx(struct dw_i2s_dev *dev)
+{
+    if (unlikely(!ngt_pd))
+        return;
+
+    u32 isr0 = i2s_read_reg(dev->i2s_base, ISR(0));
+
+    /* Check if TX FIFO can accept data (TXFE = TX FIFO Empty or has space) */
+    if (!(isr0 & ISR_TXFE))
+        return;
+
+    unsigned int burst = ngt_fifo_burst;
+    while (burst--) {
+        /* Create test pattern:
+         * Left channel: pattern + counter low byte
+         * Right channel: ~pattern + counter high byte
+         * This makes it easy to verify loopback
+         */
+        u32 tx_left = ((ngt_tx_pattern & 0xFF) << 8) | (ngt_pd->tx_cnt & 0xFF);
+        u32 tx_right = ((~ngt_tx_pattern & 0xFF) << 8) | ((ngt_pd->tx_cnt >> 8) & 0xFF);
+
+        /* Write to TX FIFO */
+        i2s_write_reg(dev->i2s_base, LRBR_LTHR(0), tx_left);
+        i2s_write_reg(dev->i2s_base, RRBR_RTHR(0), tx_right);
+
+        ngt_last_tx_left = tx_left;
+        ngt_last_tx_right = tx_right;
+
+        /* Log first few TX samples */
+        if (ngt_logged_tx < ngt_log_first) {
+            dev_info(dev->dev, "NGT_TX[%llu] L=0x%08x R=0x%08x\n",
+                     (unsigned long long)ngt_pd->tx_cnt, tx_left, tx_right);
+            ngt_logged_tx++;
+        }
+
+        ngt_pd->tx_cnt++;
+
+        /* Clear TX overrun if any */
+        i2s_read_reg(dev->i2s_base, TOR(0));
+
+        /* Check if we can write more */
+        isr0 = i2s_read_reg(dev->i2s_base, ISR(0));
+        if (!(isr0 & ISR_TXFE))
+            break;
+    }
+}
+
+/* =====================================================
+ * RX: Pop data from FIFO and verify loopback
+ * ===================================================== */
+static void ngt_fifo_pop_rx(struct dw_i2s_dev *dev)
+{
+    static u64 no_data_count = 0;
+
+    if (unlikely(!ngt_pd))
+        return;
+
+    u32 isr0 = i2s_read_reg(dev->i2s_base, ISR(0));
+
+    /* Check if RX data is available */
+    if (!(isr0 & (ISR_RXDA | ISR_RXFO))) {
+        no_data_count++;
+        if (no_data_count <= 10 || (no_data_count % 10000) == 0) {
+            dev_info(dev->dev, "NGT: NO RX DATA! ISR0=0x%08x polls=%llu no_data=%llu tx=%llu\n",
+                     isr0, ngt_pd->polls, no_data_count, ngt_pd->tx_cnt);
+        }
+        return;
+    }
+
+    /* Reset no_data counter on first data received */
+    if (no_data_count > 0 && ngt_pd->rx_cnt == 0) {
+        dev_info(dev->dev, "NGT: *** FIRST RX DATA! *** after %llu no-data polls\n", no_data_count);
+    }
+
+    unsigned int burst = ngt_fifo_burst;
+    while (burst--) {
+        /* Read from RX FIFO */
+        u32 rx_left = i2s_read_reg(dev->i2s_base, LRBR_LTHR(0));
+        u32 rx_right = i2s_read_reg(dev->i2s_base, RRBR_RTHR(0));
+
+        ngt_pd->rx_cnt++;
+
+        /* Log first few RX samples */
+        if (ngt_logged_rx < ngt_log_first) {
+            dev_info(dev->dev, "NGT_RX[%llu] L=0x%08x R=0x%08x | bytes: L[1:0]=%02x,%02x R[1:0]=%02x,%02x\n",
+                     (unsigned long long)(ngt_pd->rx_cnt - 1),
+                     rx_left, rx_right,
+                     (rx_left >> 8) & 0xFF, rx_left & 0xFF,
+                     (rx_right >> 8) & 0xFF, rx_right & 0xFF);
+            ngt_logged_rx++;
+        }
+
+        /* Verify loopback: Check if pattern byte matches */
+        u8 rx_pattern_l = (rx_left >> 8) & 0xFF;
+        u8 rx_pattern_r = (rx_right >> 8) & 0xFF;
+        u8 expected_l = ngt_tx_pattern & 0xFF;
+        u8 expected_r = ~ngt_tx_pattern & 0xFF;
+
+        if (rx_pattern_l == expected_l && rx_pattern_r == expected_r) {
+            ngt_pd->match_cnt++;
+        } else {
+            ngt_pd->mismatch_cnt++;
+            if (ngt_pd->mismatch_cnt <= 10) {
+                dev_warn(dev->dev, "NGT: MISMATCH! RX L=0x%02x (exp 0x%02x) R=0x%02x (exp 0x%02x)\n",
+                         rx_pattern_l, expected_l, rx_pattern_r, expected_r);
+            }
+        }
+
+        /* Clear RX overrun if any */
+        i2s_read_reg(dev->i2s_base, ROR(0));
+
+        /* Check if more data available */
+        isr0 = i2s_read_reg(dev->i2s_base, ISR(0));
+        if (!(isr0 & (ISR_RXDA | ISR_RXFO)))
+            break;
+    }
+}
+
+/* =====================================================
+ * HR-timer poll callback - handles both TX and RX
  * ===================================================== */
 static enum hrtimer_restart ngt_poll_cb(struct hrtimer *t)
 {
@@ -333,19 +275,19 @@ static enum hrtimer_restart ngt_poll_cb(struct hrtimer *t)
     if (unlikely(!pd || !pd->dev))
         goto out;
 
+    pd->polls++;
+
     if (pd->dev->use_pio) {
-        u32 isr0 = i2s_read_reg(pd->dev->i2s_base, ISR(0));
-        u32 iter = i2s_read_reg(pd->dev->i2s_base, ITER);
-        u32 irer = i2s_read_reg(pd->dev->i2s_base, IRER);
-
-        if ((irer & 1) && (isr0 & (ISR_RXDA | ISR_RXFO)))
-            ngt_fifo_pop_rx(pd->dev);
-
-        if ((iter & 1) && (isr0 & ISR_TXFE))
-            ngt_fifo_push_tx(pd->dev);
+        /* First push TX data, then read RX data */
+        ngt_fifo_push_tx(pd->dev);
+        ngt_fifo_pop_rx(pd->dev);
     }
 
-    pd->polls++;
+    /* Periodic stats logging */
+    if ((pd->polls % 80000) == 0) {  /* Every ~10 seconds at 8kHz */
+        dev_info(pd->dev->dev, "NGT: STATS: polls=%llu tx=%llu rx=%llu match=%llu mismatch=%llu\n",
+                 pd->polls, pd->tx_cnt, pd->rx_cnt, pd->match_cnt, pd->mismatch_cnt);
+    }
 
 out:
     hrtimer_forward_now(&pd->timer, pd->period);
@@ -353,99 +295,71 @@ out:
 }
 
 /* =====================================================
- * I2S start/stop/config
+ * I2S configuration for MASTER mode
  * ===================================================== */
-static void i2s_start(struct dw_i2s_dev *dev, struct snd_pcm_substream *substream)
+static void dw_i2s_config_master(struct dw_i2s_dev *dev)
 {
-    u32 reg = IER_IEN;
-
-    /* TDM mode configuration */
-    if (ngt_tdm_enable) {
-        reg |= (ngt_tdm_slots - 1) << IER_TDM_SLOTS_SHIFT;
-        reg |= IER_INTF_TYPE;
-        reg |= ngt_frame_offset << IER_FRAME_OFF_SHIFT;
-    }
-
-    i2s_write_reg(dev->i2s_base, IER, reg);
-
-    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-        i2s_write_reg(dev->i2s_base, ITER, 1);
-    else
-        i2s_write_reg(dev->i2s_base, IRER, 1);
-
-    i2s_write_reg(dev->i2s_base, CER, 1);
-}
-
-static void i2s_stop(struct dw_i2s_dev *dev, struct snd_pcm_substream *substream)
-{
-    i2s_clear_irqs(dev, substream->stream);
-}
-
-static void dw_i2s_config(struct dw_i2s_dev *dev, int stream)
-{
-    u32 ch;
-    u32 dmacr;
     u32 comp1, fifo_depth;
-    struct i2s_clk_config_data *config = &dev->config;
+    u32 ccr_val;
 
-    /* Use module parameters for configuration */
-    config->sample_rate = 8000;
-    config->chan_nr = 2;
+    dev->config.sample_rate = 8000;
+    dev->config.chan_nr = 2;
 
-    /* Data width based on resolution parameter */
     switch (ngt_resolution) {
-    case 0x00: config->data_width = 12; break;
-    case 0x01: config->data_width = 16; break;
-    case 0x02: config->data_width = 20; break;
-    case 0x03: config->data_width = 24; break;
-    case 0x04: config->data_width = 32; break;
-    default:   config->data_width = 16; break;
+    case 0x00: dev->config.data_width = 12; break;
+    case 0x01: dev->config.data_width = 16; break;
+    case 0x02: dev->config.data_width = 20; break;
+    case 0x03: dev->config.data_width = 24; break;
+    case 0x04: dev->config.data_width = 32; break;
+    default:   dev->config.data_width = 16; break;
     }
 
     dev->xfer_resolution = ngt_resolution;
-    dev->frame_offset = ngt_frame_offset;
 
-    /* FIFO depth from HW */
     comp1 = i2s_read_reg(dev->i2s_base, dev->i2s_reg_comp1);
     fifo_depth = 1 << (1 + COMP1_FIFO_DEPTH_GLOBAL(comp1));
 
     if (!dev->fifo_th)
         dev->fifo_th = fifo_depth / 2;
 
-    i2s_disable_channels(dev, stream);
+    /* Disable all channels first */
+    i2s_disable_channels(dev, SNDRV_PCM_STREAM_PLAYBACK);
+    i2s_disable_channels(dev, SNDRV_PCM_STREAM_CAPTURE);
 
-    dmacr = i2s_read_reg(dev->i2s_base, I2S_DMACR);
-    if (stream == SNDRV_PCM_STREAM_PLAYBACK)
-        dmacr &= ~(DMACR_DMAEN_TXCH0 * 0xf);
-    else
-        dmacr &= ~(DMACR_DMAEN_RXCH0 * 0xf);
+    /* Configure TX channel 0 */
+    i2s_write_reg(dev->i2s_base, TCR(0), ngt_resolution);
+    i2s_write_reg(dev->i2s_base, TFCR(0), dev->fifo_th - 1);
+    i2s_write_reg(dev->i2s_base, TER(0), TER_TXCHEN);
 
-    /* Program channel 0 */
-    for (ch = 0; ch < 1; ch++) {
-        if (stream == SNDRV_PCM_STREAM_PLAYBACK) {
-            i2s_write_reg(dev->i2s_base, TCR(ch), dev->xfer_resolution);
-            i2s_write_reg(dev->i2s_base, TFCR(ch), fifo_depth - dev->fifo_th - 1);
-            i2s_write_reg(dev->i2s_base, TER(ch), TER_TXCHEN);
-            dmacr |= (DMACR_DMAEN_TXCH0 << ch);
-        } else {
-            i2s_write_reg(dev->i2s_base, RCR(ch), dev->xfer_resolution);
-            i2s_write_reg(dev->i2s_base, RFCR(ch), dev->fifo_th - 1);
-            i2s_write_reg(dev->i2s_base, RER(ch), RER_RXCHEN);
-            dmacr |= (DMACR_DMAEN_RXCH0 << ch);
-        }
-    }
+    /* Configure RX channel 0 */
+    i2s_write_reg(dev->i2s_base, RCR(0), ngt_resolution);
+    i2s_write_reg(dev->i2s_base, RFCR(0), dev->fifo_th - 1);
+    i2s_write_reg(dev->i2s_base, RER(0), RER_RXCHEN);
 
-    i2s_write_reg(dev->i2s_base, I2S_DMACR, dmacr);
+    /* Configure CCR for MASTER mode
+     *
+     * CCR Register bits:
+     * [2:0] SCLKG - Serial clock gating (0-7)
+     * [4:3] WSS   - Word Select Size
+     *               0 = 16 SCLK cycles
+     *               1 = 24 SCLK cycles
+     *               2 = 32 SCLK cycles
+     *               3 = Reserved
+     *
+     * For master mode, we need proper clock gating
+     * SCLKG = 0 means no gating (continuous clock)
+     */
+    ccr_val = (ngt_wss & 0x3) << 3;  /* WSS in bits [4:3] */
+    ccr_val |= (ngt_ccr_value & 0x7); /* SCLKG in bits [2:0] */
 
-    /* CCR configuration - slave mode by default, but allow override */
-    if (ngt_ccr_override >= 0) {
-        i2s_write_reg(dev->i2s_base, CCR, ngt_ccr_override);
-    }
-    /* else CCR stays at 0 for slave mode */
+    i2s_write_reg(dev->i2s_base, CCR, ccr_val);
+
+    dev_info(dev->dev, "NGT: MASTER mode configured: CCR=0x%08x (WSS=%d, SCLKG=%d)\n",
+             ccr_val, ngt_wss, ngt_ccr_value & 0x7);
 }
 
 /* =====================================================
- * DAI operations (minimal for test driver)
+ * DAI operations (minimal)
  * ===================================================== */
 static int dw_i2s_startup(struct snd_pcm_substream *substream, struct snd_soc_dai *cpu_dai)
 {
@@ -461,54 +375,17 @@ static void dw_i2s_shutdown(struct snd_pcm_substream *substream, struct snd_soc_
 static int dw_i2s_hw_params(struct snd_pcm_substream *substream,
         struct snd_pcm_hw_params *params, struct snd_soc_dai *dai)
 {
-    struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(dai);
-    dw_i2s_config(dev, substream->stream);
     return 0;
 }
 
 static int dw_i2s_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
 {
-    struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(dai);
-    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-        i2s_write_reg(dev->i2s_base, TXFFR, 1);
-    else
-        i2s_write_reg(dev->i2s_base, RXFFR, 1);
     return 0;
 }
 
 static int dw_i2s_trigger(struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai)
 {
-    struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(dai);
-    int ret = 0;
-
-    switch (cmd) {
-    case SNDRV_PCM_TRIGGER_START:
-    case SNDRV_PCM_TRIGGER_RESUME:
-    case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-        dev->active++;
-        i2s_start(dev, substream);
-        if (ngt_use_poll && dev->active == 1 && ngt_pd && !ngt_pd->running) {
-            ngt_logged_rx = 0;
-            ngt_logged_tx = 0;
-            ngt_pd->running = true;
-            hrtimer_start(&ngt_pd->timer, ngt_pd->period, HRTIMER_MODE_REL_PINNED);
-        }
-        break;
-    case SNDRV_PCM_TRIGGER_STOP:
-    case SNDRV_PCM_TRIGGER_SUSPEND:
-    case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-        dev->active--;
-        i2s_stop(dev, substream);
-        if (ngt_use_poll && dev->active <= 0 && ngt_pd) {
-            hrtimer_cancel(&ngt_pd->timer);
-            ngt_pd->running = false;
-        }
-        break;
-    default:
-        ret = -EINVAL;
-        break;
-    }
-    return ret;
+    return 0;
 }
 
 static int dw_i2s_set_fmt(struct snd_soc_dai *cpu_dai, unsigned int fmt)
@@ -534,12 +411,12 @@ static const struct snd_soc_dai_ops dw_i2s_dai_ops = {
 };
 
 static const struct snd_soc_component_driver dw_i2s_component = {
-    .name = "dw-i2s-ngt-test",
+    .name = "dw-i2s-ngt-master",
     .legacy_dai_naming = 1,
 };
 
 /* =====================================================
- * Probe - device initialization
+ * Probe - device initialization for MASTER mode
  * ===================================================== */
 static int dw_i2s_probe(struct platform_device *pdev)
 {
@@ -547,7 +424,7 @@ static int dw_i2s_probe(struct platform_device *pdev)
     struct resource *res;
     struct snd_soc_dai_driver *dw_i2s_dai;
     int ret;
-    u32 comp1, comp2, fifo_depth;
+    u32 comp1, fifo_depth;
 
     dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
     if (!dev)
@@ -567,20 +444,31 @@ static int dw_i2s_probe(struct platform_device *pdev)
     dev->i2s_reg_comp1 = I2S_COMP_PARAM_1;
     dev->i2s_reg_comp2 = I2S_COMP_PARAM_2;
 
-    /* Reset if available */
     dev->reset = devm_reset_control_array_get_optional_shared(&pdev->dev);
     if (!IS_ERR(dev->reset))
         reset_control_deassert(dev->reset);
 
-    /* Read HW configuration */
+    /* Get the I2S clock if available */
+    dev->clk = devm_clk_get_optional(&pdev->dev, "i2sclk");
+    if (IS_ERR(dev->clk)) {
+        dev_warn(&pdev->dev, "Could not get i2sclk: %ld\n", PTR_ERR(dev->clk));
+        dev->clk = NULL;
+    } else if (dev->clk) {
+        ret = clk_prepare_enable(dev->clk);
+        if (ret) {
+            dev_err(&pdev->dev, "Failed to enable i2sclk: %d\n", ret);
+        } else {
+            dev_info(&pdev->dev, "NGT: i2sclk enabled, rate=%lu Hz\n",
+                     clk_get_rate(dev->clk));
+        }
+    }
+
     comp1 = i2s_read_reg(dev->i2s_base, I2S_COMP_PARAM_1);
-    comp2 = i2s_read_reg(dev->i2s_base, I2S_COMP_PARAM_2);
     fifo_depth = 1 << (1 + COMP1_FIFO_DEPTH_GLOBAL(comp1));
 
-    dev->capability = DW_I2S_SLAVE;  /* Force slave mode */
+    dev->capability = DW_I2S_MASTER;  /* MASTER mode */
     dev->fifo_th = fifo_depth / 2;
 
-    /* Configure DAI */
     dw_i2s_dai->playback.channels_min = 2;
     dw_i2s_dai->playback.channels_max = 2;
     dw_i2s_dai->playback.rates = SNDRV_PCM_RATE_8000;
@@ -623,11 +511,11 @@ static int dw_i2s_probe(struct platform_device *pdev)
     ngt_pd->period = ktime_set(0, ngt_poll_us * 1000);
 
     /* =====================================================
-     * AUTOSTART with configurable parameters
+     * AUTOSTART in MASTER mode
      * ===================================================== */
     if (ngt_use_poll && ngt_autostart) {
         dev_info(dev->dev, "NGT: ============================================\n");
-        dev_info(dev->dev, "NGT: I2S TEST DRIVER - Configurable Parameters\n");
+        dev_info(dev->dev, "NGT: I2S MASTER MODE - Loopback Test Driver\n");
         dev_info(dev->dev, "NGT: ============================================\n");
         dev_info(dev->dev, "NGT: Resolution      = 0x%02x (%d-bit)\n",
                  ngt_resolution,
@@ -635,23 +523,13 @@ static int dw_i2s_probe(struct platform_device *pdev)
                  ngt_resolution == 0x01 ? 16 :
                  ngt_resolution == 0x02 ? 20 :
                  ngt_resolution == 0x03 ? 24 : 32);
-        dev_info(dev->dev, "NGT: Frame offset    = %d (%s)\n",
-                 ngt_frame_offset,
-                 ngt_frame_offset ? "I2S Standard" : "Left-Justified");
-        dev_info(dev->dev, "NGT: TDM mode        = %s (slots=%d)\n",
-                 ngt_tdm_enable ? "ENABLED" : "disabled", ngt_tdm_slots);
-        dev_info(dev->dev, "NGT: A-law shift     = %d bits\n", ngt_alaw_shift);
-        dev_info(dev->dev, "NGT: Channel swap    = %s\n", ngt_swap_channels ? "YES" : "NO");
+        dev_info(dev->dev, "NGT: TX Pattern      = 0x%02x\n", ngt_tx_pattern & 0xFF);
         dev_info(dev->dev, "NGT: Poll interval   = %d us\n", ngt_poll_us);
-        dev_info(dev->dev, "NGT: CCR override    = %d\n", ngt_ccr_override);
+        dev_info(dev->dev, "NGT: WSS             = %d (%d SCLK cycles)\n",
+                 ngt_wss, ngt_wss == 0 ? 16 : ngt_wss == 1 ? 24 : 32);
         dev_info(dev->dev, "NGT: ============================================\n");
 
-        /* Apply configuration */
-        dev->config.sample_rate = 8000;
-        dev->config.chan_nr = 2;
-        dev->xfer_resolution = ngt_resolution;
-
-        /* Clean stop */
+        /* Clean stop first */
         i2s_write_reg(dev->i2s_base, CER, 0);
         i2s_write_reg(dev->i2s_base, IER, 0);
         i2s_write_reg(dev->i2s_base, IRER, 0);
@@ -661,56 +539,56 @@ static int dw_i2s_probe(struct platform_device *pdev)
         i2s_write_reg(dev->i2s_base, RXFFR, 1);
         i2s_write_reg(dev->i2s_base, TXFFR, 1);
 
-        /* Configure both directions */
-        dw_i2s_config(dev, SNDRV_PCM_STREAM_PLAYBACK);
-        dw_i2s_config(dev, SNDRV_PCM_STREAM_CAPTURE);
+        /* Configure for MASTER mode */
+        dw_i2s_config_master(dev);
 
-        /* Apply resolution to registers */
-        i2s_write_reg(dev->i2s_base, TCR(0), ngt_resolution);
-        i2s_write_reg(dev->i2s_base, RCR(0), ngt_resolution);
-        i2s_write_reg(dev->i2s_base, RFCR(0), 0x07);
+        /* Enable I2S block */
+        i2s_write_reg(dev->i2s_base, IER, IER_IEN);
 
-        /* Build IER register with TDM settings if enabled */
-        u32 ier_val = IER_IEN;
-        if (ngt_tdm_enable) {
-            ier_val |= IER_INTF_TYPE;  /* Enable TDM */
-            ier_val |= ((ngt_tdm_slots - 1) << IER_TDM_SLOTS_SHIFT);
-            ier_val |= (ngt_frame_offset << IER_FRAME_OFF_SHIFT);
-            dev_info(dev->dev, "NGT: TDM IER = 0x%08x\n", ier_val);
-        }
+        /* Enable both TX and RX */
+        i2s_write_reg(dev->i2s_base, ITER, 1);  /* TX enable */
+        i2s_write_reg(dev->i2s_base, IRER, 1);  /* RX enable */
 
-        /* Enable I2S */
-        i2s_write_reg(dev->i2s_base, IER, ier_val);
-        i2s_write_reg(dev->i2s_base, IRER, 1);
-        i2s_write_reg(dev->i2s_base, ITER, 1);
+        /* Enable clocks - this starts BCLK and FS generation in master mode */
         i2s_write_reg(dev->i2s_base, CER, 1);
 
         /* Reset counters */
         ngt_logged_rx = 0;
         ngt_logged_tx = 0;
-        ngt_d5_count = 0;
-        ngt_ff_count = 0;
+        ngt_pd->polls = 0;
+        ngt_pd->tx_cnt = 0;
+        ngt_pd->rx_cnt = 0;
+        ngt_pd->match_cnt = 0;
+        ngt_pd->mismatch_cnt = 0;
 
-        /* Start poller */
-        ngt_pd->running = true;
-        hrtimer_start(&ngt_pd->timer, ngt_pd->period, HRTIMER_MODE_REL_PINNED);
-
-        /* Register dump */
-        dev_info(dev->dev, "NGT: REG DUMP:\n");
-        dev_info(dev->dev, "  IER=0x%08x CER=0x%08x ITER=0x%08x IRER=0x%08x\n",
+        /* Initial register dump */
+        dev_info(dev->dev, "NGT: MASTER MODE REG DUMP:\n");
+        dev_info(dev->dev, "  IER=0x%08x CER=0x%08x\n",
             i2s_read_reg(dev->i2s_base, IER),
-            i2s_read_reg(dev->i2s_base, CER),
+            i2s_read_reg(dev->i2s_base, CER));
+        dev_info(dev->dev, "  ITER=0x%08x IRER=0x%08x\n",
             i2s_read_reg(dev->i2s_base, ITER),
             i2s_read_reg(dev->i2s_base, IRER));
         dev_info(dev->dev, "  TCR0=0x%08x RCR0=0x%08x CCR=0x%08x\n",
             i2s_read_reg(dev->i2s_base, TCR(0)),
             i2s_read_reg(dev->i2s_base, RCR(0)),
             i2s_read_reg(dev->i2s_base, CCR));
+        dev_info(dev->dev, "  TER0=0x%08x RER0=0x%08x\n",
+            i2s_read_reg(dev->i2s_base, TER(0)),
+            i2s_read_reg(dev->i2s_base, RER(0)));
         dev_info(dev->dev, "  TFCR0=0x%08x RFCR0=0x%08x\n",
             i2s_read_reg(dev->i2s_base, TFCR(0)),
             i2s_read_reg(dev->i2s_base, RFCR(0)));
+        dev_info(dev->dev, "  ISR0=0x%08x\n",
+            i2s_read_reg(dev->i2s_base, ISR(0)));
 
-        dev_info(dev->dev, "NGT: Polling started!\n");
+        /* Start poller */
+        ngt_pd->running = true;
+        hrtimer_start(&ngt_pd->timer, ngt_pd->period, HRTIMER_MODE_REL_PINNED);
+
+        dev_info(dev->dev, "NGT: MASTER mode polling started!\n");
+        dev_info(dev->dev, "NGT: Sending pattern 0x%02x, expecting loopback...\n",
+                 ngt_tx_pattern & 0xFF);
     }
 
     return 0;
@@ -719,10 +597,23 @@ static int dw_i2s_probe(struct platform_device *pdev)
 static void dw_i2s_remove(struct platform_device *pdev)
 {
     struct dw_i2s_dev *dev = dev_get_drvdata(&pdev->dev);
+
+    dev_info(&pdev->dev, "NGT: Removing driver.\n");
+    dev_info(&pdev->dev, "NGT: FINAL STATS: polls=%llu tx=%llu rx=%llu match=%llu mismatch=%llu\n",
+             ngt_pd ? ngt_pd->polls : 0,
+             ngt_pd ? ngt_pd->tx_cnt : 0,
+             ngt_pd ? ngt_pd->rx_cnt : 0,
+             ngt_pd ? ngt_pd->match_cnt : 0,
+             ngt_pd ? ngt_pd->mismatch_cnt : 0);
+
     if (ngt_pd) {
         hrtimer_cancel(&ngt_pd->timer);
         ngt_pd = NULL;
     }
+
+    if (dev->clk)
+        clk_disable_unprepare(dev->clk);
+
     if (!IS_ERR(dev->reset))
         reset_control_assert(dev->reset);
     pm_runtime_disable(&pdev->dev);
@@ -746,6 +637,6 @@ static struct platform_driver dw_i2s_driver = {
 module_platform_driver(dw_i2s_driver);
 
 MODULE_AUTHOR("NGT");
-MODULE_DESCRIPTION("DesignWare I2S Test Driver - Configurable I2S/TDM modes");
+MODULE_DESCRIPTION("DesignWare I2S MASTER Mode - Loopback Test Driver");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:designware_i2s-NGT");
