@@ -75,6 +75,24 @@ static unsigned int ngt_ccr = 0x10;  /* Default: WSS=2 (32-bit) gives both chann
 module_param(ngt_ccr, uint, 0644);
 MODULE_PARM_DESC(ngt_ccr, "NGT: CCR register value (bits[4:3]=WSS, bits[2:0]=SCLKG)");
 
+/* Frame offset: 0=Left-Justified (no delay), 1=Standard I2S (1-bit delay) */
+static unsigned int ngt_frame_offset = 0;  /* Default: Left-Justified for FPGA loopback */
+module_param(ngt_frame_offset, uint, 0644);
+MODULE_PARM_DESC(ngt_frame_offset, "NGT: Frame offset (0=Left-Justified, 1=Standard I2S)");
+
+/* Sample rate - controls BCLK speed. Lower = slower BCLK */
+static unsigned int ngt_sample_rate = 8000;  /* Default: 8000 Hz */
+module_param(ngt_sample_rate, uint, 0644);
+MODULE_PARM_DESC(ngt_sample_rate, "NGT: Sample rate in Hz (lower = slower BCLK, try 1000 or 100)");
+
+/* Direct BCLK divider - if clk_set_rate doesn't work, try this
+ * BCLK = source_clock / ngt_bclk_div
+ * For 50 MHz source: div=100 gives 500 kHz, div=1000 gives 50 kHz, div=10000 gives 5 kHz
+ */
+static unsigned int ngt_bclk_div = 0;  /* 0 = use clk_set_rate, >0 = direct divider */
+module_param(ngt_bclk_div, uint, 0644);
+MODULE_PARM_DESC(ngt_bclk_div, "NGT: Direct BCLK divider (0=auto, 100=500kHz, 1000=50kHz, 10000=5kHz from 50MHz)");
+
 //Polar state
 struct ngt_poll_data {
 	struct hrtimer timer;
@@ -447,7 +465,7 @@ static void dw_i2s_config(struct dw_i2s_dev *dev, int stream)
 	/* =====================================================
 	 * NGT HARD LOCK — FPGA EXPECTATION
 	 * ===================================================== */
-	config->sample_rate   = 8000;
+	config->sample_rate   = ngt_sample_rate;  /* Use module parameter */
 	config->chan_nr       = 2;
 	config->data_width    = 32;
 	dev->xfer_resolution  = 0x05;   /* 16-bit */
@@ -653,19 +671,19 @@ static int dw_i2s_hw_params(struct snd_pcm_substream *substream,
 		i2s_write_reg(dev->i2s_base, CCR, dev->ccr);
 	}
 
-	/* NGT: Force 8kHz A-law configuration for FPGA - MUST BE AT END! */
-/* NGT: accept only 8kHz, 16-bit, stereo */
-	if (params_rate(params) != 8000 ||
+	/* NGT: Force configured sample rate for FPGA - MUST BE AT END! */
+	/* NGT: accept only configured rate, 16-bit, stereo */
+	if (params_rate(params) != ngt_sample_rate ||
 		params_channels(params) != 2 ||
 		params_format(params) != SNDRV_PCM_FORMAT_S16_LE) {
 		dev_err(dev->dev,
-			"NGT: only 8000Hz / S16_LE / 2ch supported (got %uHz, %uch, fmt=%d)\n",
-			params_rate(params), params_channels(params), params_format(params));
+			"NGT: only %uHz / S16_LE / 2ch supported (got %uHz, %uch, fmt=%d)\n",
+			ngt_sample_rate, params_rate(params), params_channels(params), params_format(params));
 		return -EINVAL;
 	}
 
 	/* Lock config to FPGA expectation */
-	config->sample_rate = 8000;
+	config->sample_rate = ngt_sample_rate;
 	config->chan_nr     = 2;
 	config->data_width  = 32;
 	dev->xfer_resolution = 0x05;
@@ -700,7 +718,7 @@ static enum hrtimer_restart ngt_poll_cb(struct hrtimer *t)
     u32 tx_data, rx_data, rx_corrected;
     u32 isr;
     int i;
-    bool pattern_match;
+    bool exact_match, direct_match, shifted_match;
     static u64 total_rx = 0;
     static u64 match_count = 0;
     static u64 nonzero_count = 0;
@@ -712,67 +730,76 @@ static enum hrtimer_restart ngt_poll_cb(struct hrtimer *t)
 
     if (dev->use_pio) {
         /* =======================================================
-         * SIMPLIFIED LOOPBACK TEST
+         * LOOPBACK TEST WITH SHIFT CORRECTION
          *
-         * - Uses LEFT channel ONLY (simpler, more reliable)
-         * - Sends CONSTANT pattern (no counter, easier to verify)
-         * - Applies 1-bit left shift to correct FPGA loopback shift
+         * Due to I2S protocol timing (1-bit delay after WS edge),
+         * and FPGA direct loopback, RX data is shifted right by 1 bit.
+         *
+         * At 50 MHz BCLK: RX = TX >> 1 (1-bit shift observed)
+         * At 512 kHz BCLK: RX = TX (NO shift! timing works correctly)
          *
          * TX Pattern: 0xD5A5D5A5
-         * Expected RX (raw): 0x6AD2EAD2 (shifted right by 1)
-         * Expected RX (corrected): 0xD5A5D5A4 (close match, LSB lost)
+         * Binary: 1101 0101 1010 0101 1101 0101 1010 0101
          * ======================================================= */
 
-        /* Constant TX pattern - same every time */
-        tx_data = 0xD5A5D5A5;
+        /* TX pattern for testing */
+        tx_data = 0xD5A5D5A5;  /* Original test pattern */
 
-        /* Write to BOTH L and R (but we only care about L) */
         i2s_write_reg(dev->i2s_base, LRBR_LTHR(0), tx_data);
         i2s_write_reg(dev->i2s_base, RRBR_RTHR(0), tx_data);
         pd->tx_cnt++;
 
-        /* Read from RX FIFO - LEFT channel only */
+        /* Read from RX FIFO */
         for (i = 0; i < 16; i++) {
             isr = i2s_read_reg(dev->i2s_base, ISR(0));
 
             if (!(isr & (ISR_RXDA | ISR_RXFO)))
                 break;
 
-            /* Read LEFT channel only */
             rx_data = i2s_read_reg(dev->i2s_base, LRBR_LTHR(0));
-            (void)i2s_read_reg(dev->i2s_base, RRBR_RTHR(0));  /* Discard right */
+            (void)i2s_read_reg(dev->i2s_base, RRBR_RTHR(0));
 
             total_rx++;
 
-            /* Clear overrun if present */
             if (isr & ISR_RXFO)
                 (void)i2s_read_reg(dev->i2s_base, ROR(0));
 
             if (rx_data == 0)
-                continue;  /* Skip zeros */
+                continue;
 
             nonzero_count++;
 
-            /* Apply 1-bit left shift correction */
+            /* Check for matches:
+             * 1. Direct match (RX == TX) - happens at slow BCLK (512 kHz)
+             * 2. Shifted match (RX << 1 == TX) - happens at fast BCLK (50 MHz)
+             */
             rx_corrected = rx_data << 1;
 
-            /* Compare upper 24 bits (ignore lowest byte which has shift artifacts) */
-            pattern_match = ((rx_corrected & 0xFFFFFF00) == (tx_data & 0xFFFFFF00));
+            direct_match = (rx_data == tx_data);
+            shifted_match = (rx_corrected == tx_data);
+            exact_match = direct_match || shifted_match;
 
-            if (pattern_match)
+            if (exact_match)
                 match_count++;
 
-            /* Log first few samples */
+            /* Log results */
             if (ngt_logged_rx < ngt_log_first) {
+                const char *match_type;
+                if (direct_match)
+                    match_type = "DIRECT MATCH (no shift)";
+                else if (shifted_match)
+                    match_type = "SHIFTED MATCH (1-bit delay)";
+                else
+                    match_type = "MISMATCH";
+
                 dev_info(dev->dev,
-                    "NGT[%llu] TX=0x%08x | RX_raw=0x%08x | RX<<1=0x%08x | %s | match=%llu/%llu (%.0llu%%)\n",
+                    "NGT[%llu] TX=0x%08x | RX=0x%08x | %s | exact=%llu/%llu (%.0llu%%)\n",
                     total_rx,
                     tx_data,
                     rx_data,
-                    rx_corrected,
-                    pattern_match ? "OK" : "BAD",
+                    match_type,
                     match_count, nonzero_count,
-                    nonzero_count > 0 ? (match_count * 100 / nonzero_count) : 0);
+                    nonzero_count > 0 ? (match_count * 100) / nonzero_count : 0);
                 ngt_logged_rx++;
             }
         }
@@ -1570,7 +1597,7 @@ static int dw_i2s_probe(struct platform_device *pdev)
 
 	if (ngt_use_poll && ngt_autostart) {
 		/* Hard lock expected stream settings */
-		dev->config.sample_rate = 8000;
+		dev->config.sample_rate = ngt_sample_rate;  /* Use module parameter */
 		dev->config.data_width  = 32;
 		dev->config.chan_nr     = 2;
 		dev->xfer_resolution    = 0x05;
@@ -1594,6 +1621,88 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		i2s_write_reg(dev->i2s_base, RCR(0), 0x05);
 		i2s_write_reg(dev->i2s_base, RFCR(0), 0x07); // Trigger FIFO on both channels
 
+		/* ============================================================
+		 * CRITICAL: Set the actual BCLK clock rate!
+		 * BCLK = sample_rate * bits_per_channel * channels
+		 * BCLK = sample_rate * 32 * 2 = sample_rate * 64
+		 *
+		 * For slow BCLK demonstration:
+		 *   ngt_sample_rate=100  -> BCLK = 6.4 kHz (easy to see on scope)
+		 *   ngt_sample_rate=1000 -> BCLK = 64 kHz
+		 *   ngt_sample_rate=8000 -> BCLK = 512 kHz (default)
+		 * ============================================================ */
+		{
+			u32 target_bclk = ngt_sample_rate * 64;  /* 32-bit stereo */
+			int clk_ret;
+			unsigned long rate_before, rate_after, rounded_rate;
+
+			dev_info(dev->dev, "NGT: ========== CLOCK CONFIGURATION ==========\n");
+			dev_info(dev->dev, "NGT: Target sample_rate = %u Hz\n", ngt_sample_rate);
+			dev_info(dev->dev, "NGT: Target BCLK = %u Hz (sample_rate * 64)\n", target_bclk);
+
+			if (dev->clk) {
+				/* Get current rate before any changes */
+				rate_before = clk_get_rate(dev->clk);
+				dev_info(dev->dev, "NGT: Clock rate BEFORE: %lu Hz (%lu MHz)\n",
+					rate_before, rate_before / 1000000);
+
+				/* Try to find out what rate is actually possible */
+				rounded_rate = clk_round_rate(dev->clk, target_bclk);
+				dev_info(dev->dev, "NGT: clk_round_rate(%u) returned: %lu Hz\n",
+					target_bclk, rounded_rate);
+
+				/* Try to set the clock rate */
+				clk_ret = clk_set_rate(dev->clk, target_bclk);
+				if (clk_ret) {
+					dev_err(dev->dev, "NGT: clk_set_rate(%u) FAILED: %d\n",
+						target_bclk, clk_ret);
+				} else {
+					dev_info(dev->dev, "NGT: clk_set_rate(%u) returned SUCCESS (ret=0)\n", target_bclk);
+				}
+
+				rate_after = clk_get_rate(dev->clk);
+				dev_info(dev->dev, "NGT: Clock rate AFTER: %lu Hz (%lu MHz)\n",
+					rate_after, rate_after / 1000000);
+
+				if (rate_before == rate_after) {
+					dev_warn(dev->dev, "NGT: *** WARNING - Clock rate did NOT change! ***\n");
+					if (rate_after > 10000000) {  /* Still in MHz range */
+						dev_warn(dev->dev, "NGT: The 50MHz clock is passing through un-divided!\n");
+						dev_warn(dev->dev, "NGT: This is likely because:\n");
+						dev_warn(dev->dev, "NGT:   1. RP1 I2S clock doesn't support clk_set_rate(), OR\n");
+						dev_warn(dev->dev, "NGT:   2. The clock divider is not in the I2S IP itself\n");
+						dev_warn(dev->dev, "NGT: The I2S clock rate may need device tree configuration.\n");
+					}
+				} else {
+					dev_info(dev->dev, "NGT: Clock rate changed! Old=%lu, New=%lu\n",
+						rate_before, rate_after);
+				}
+
+				/* Also log the clock parent if available */
+				{
+					struct clk *parent_clk = clk_get_parent(dev->clk);
+					if (parent_clk) {
+						unsigned long parent_rate = clk_get_rate(parent_clk);
+						dev_info(dev->dev, "NGT: Parent clock rate: %lu Hz (%lu MHz)\n",
+							parent_rate, parent_rate / 1000000);
+					}
+				}
+			} else {
+				dev_err(dev->dev, "NGT: dev->clk is NULL! Cannot control clock rate.\n");
+			}
+
+			/* If ngt_bclk_div is set, try to manually calculate what divider would be needed */
+			if (ngt_bclk_div > 0) {
+				dev_info(dev->dev, "NGT: ngt_bclk_div=%u specified\n", ngt_bclk_div);
+				dev_info(dev->dev, "NGT: For 50MHz source: 50000000 / %u = %u Hz BCLK\n",
+					ngt_bclk_div, 50000000 / ngt_bclk_div);
+				dev_info(dev->dev, "NGT: NOTE: Direct divider control is not yet implemented.\n");
+				dev_info(dev->dev, "NGT: The RP1 clock may need device tree overlay configuration.\n");
+			}
+
+			dev_info(dev->dev, "NGT: ==========================================\n");
+		}
+
 		/* Set CCR register for clock/frame configuration
 		 * Bits [4:3] = WSS (Word Select Size): 0=16cyc, 1=24cyc, 2=32cyc
 		 * Bits [2:0] = SCLKG (clock gating)
@@ -1603,8 +1712,33 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		dev_info(dev->dev, "NGT: CCR set to 0x%02x (WSS=%d, SCLKG=%d)\n",
 			ngt_ccr, (ngt_ccr >> 3) & 0x3, ngt_ccr & 0x7);
 
-		/* Enable I2S core + blocks */
-		i2s_write_reg(dev->i2s_base, IER, IER_IEN); /* global enable */
+		/* Enable I2S core with frame offset configuration
+		 * IER register bits:
+		 *   Bit 0: IEN (global enable)
+		 *   Bit 8: INTF_TYPE (0=I2S, 1=TDM) - set to enable frame_offset
+		 *   Bits [11:9]: FRAME_OFF (0=Left-Justified, 1=Standard I2S)
+		 *
+		 * For FPGA direct loopback: use frame_offset=0 (Left-Justified)
+		 * This eliminates the 1-bit delay and gives EXACT data match!
+		 */
+		{
+			u32 ier_val = IER_IEN;  /* Start with global enable */
+
+			/* If frame_offset control is needed, set INTF_TYPE bit */
+			if (ngt_frame_offset == 0) {
+				/* Left-Justified mode: set INTF_TYPE, frame_offset=0 */
+				ier_val |= (1 << 8);  /* INTF_TYPE = 1 */
+				ier_val |= (0 << 9);  /* FRAME_OFF = 0 (no delay) */
+				dev_info(dev->dev, "NGT: IER=0x%08x (Left-Justified, frame_offset=0)\n", ier_val);
+			} else {
+				/* Standard I2S mode: set INTF_TYPE, frame_offset=1 */
+				ier_val |= (1 << 8);  /* INTF_TYPE = 1 */
+				ier_val |= (1 << 9);  /* FRAME_OFF = 1 (1-bit delay) */
+				dev_info(dev->dev, "NGT: IER=0x%08x (Standard I2S, frame_offset=1)\n", ier_val);
+			}
+
+			i2s_write_reg(dev->i2s_base, IER, ier_val);
+		}
 		i2s_write_reg(dev->i2s_base, IRER, 1);      /* RX block enable */
 		i2s_write_reg(dev->i2s_base, ITER, 1);      /* TX block enable */
 		i2s_write_reg(dev->i2s_base, CER, 1);       /* core enable */
@@ -1619,6 +1753,24 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		ngt_pd->running = true;
 		hrtimer_start(&ngt_pd->timer, ngt_pd->period, HRTIMER_MODE_REL_PINNED);
 		dev_info(dev->dev, "NGT: autostart done, polling started (%u us)\n", ngt_poll_us);
+
+		/* Print detailed configuration for debugging */
+		{
+			u32 frame_bits = 32 * 2;  /* 32 bits x 2 channels = 64 bits per frame */
+			u32 bclk_hz = ngt_sample_rate * frame_bits;
+			dev_info(dev->dev, "NGT: ============================================\n");
+			dev_info(dev->dev, "NGT: I2S Configuration:\n");
+			dev_info(dev->dev, "NGT:   Sample Rate: %u Hz\n", ngt_sample_rate);
+			dev_info(dev->dev, "NGT:   Data Width:  32 bits per channel\n");
+			dev_info(dev->dev, "NGT:   Channels:    2 (stereo)\n");
+			dev_info(dev->dev, "NGT:   Frame Size:  64 bits (32L + 32R)\n");
+			dev_info(dev->dev, "NGT:   Frame Size:  8 bytes (4 LEFT + 4 RIGHT)\n");
+			dev_info(dev->dev, "NGT:   BCLK:        %u Hz (%u kHz)\n", bclk_hz, bclk_hz/1000);
+			dev_info(dev->dev, "NGT:   CCR:         0x%02x (WSS=%d)\n", ngt_ccr, (ngt_ccr >> 3) & 0x3);
+			dev_info(dev->dev, "NGT:   Frame Offset: %u (%s)\n", ngt_frame_offset,
+				ngt_frame_offset == 0 ? "Left-Justified" : "Standard I2S");
+			dev_info(dev->dev, "NGT: ============================================\n");
+		}
 	}
 
 	return 0;
