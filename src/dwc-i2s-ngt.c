@@ -81,9 +81,9 @@ module_param(ngt_frame_offset, uint, 0644);
 MODULE_PARM_DESC(ngt_frame_offset, "NGT: Frame offset (0=Left-Justified, 1=Standard I2S)");
 
 /* Sample rate - controls BCLK speed. Lower = slower BCLK */
-static unsigned int ngt_sample_rate = 8000;  /* Default: 8000 Hz */
+static unsigned int ngt_sample_rate = 32000;  /* Default: 32000 Hz for E1 (2.048 MHz BCLK) */
 module_param(ngt_sample_rate, uint, 0644);
-MODULE_PARM_DESC(ngt_sample_rate, "NGT: Sample rate in Hz (lower = slower BCLK, try 1000 or 100)");
+MODULE_PARM_DESC(ngt_sample_rate, "NGT: Sample rate in Hz (LRCLK frequency, controls BCLK = sample_rate * 64)");
 
 /* Direct BCLK divider - if clk_set_rate doesn't work, try this
  * BCLK = source_clock / ngt_bclk_div
@@ -92,6 +92,29 @@ MODULE_PARM_DESC(ngt_sample_rate, "NGT: Sample rate in Hz (lower = slower BCLK, 
 static unsigned int ngt_bclk_div = 0;  /* 0 = use clk_set_rate, >0 = direct divider */
 module_param(ngt_bclk_div, uint, 0644);
 MODULE_PARM_DESC(ngt_bclk_div, "NGT: Direct BCLK divider (0=auto, 100=500kHz, 1000=50kHz, 10000=5kHz from 50MHz)");
+
+/* 16-byte collection mode
+ * Since hardware only supports up to 32 bits per LRCLK, we collect multiple frames
+ * in software to build 16 bytes per channel.
+ *
+ * ngt_collect_frames: Number of frames to collect before outputting packet
+ *   For 8-bit mode (CCR=0x00):  collect 16 frames = 16 bytes per channel
+ *   For 32-bit mode (CCR=0x10): collect 4 frames = 16 bytes per channel
+ */
+static unsigned int ngt_collect_frames = 1;  /* Default: 1 = no collection, output each frame */
+module_param(ngt_collect_frames, uint, 0644);
+MODULE_PARM_DESC(ngt_collect_frames, "NGT: Frames to collect (1=none, 4=16B from 32-bit, 16=16B from 8-bit)");
+
+/* Buffers for 8-byte collection (4 bytes L + 4 bytes R per FSYNC cycle) */
+static u8 ngt_left_buffer[4];
+static u8 ngt_right_buffer[4];
+static u64 ngt_packet_count = 0;
+
+/* NOTE: For 8-byte mode (4 bytes L + 4 bytes R per FSYNC cycle):
+ * Use 32-bit I2S mode (CCR=0x10, WSS=2)
+ * Hardware automatically gives 4 bytes per channel per FSYNC cycle
+ * No software collection needed - total 8 bytes per cycle!
+ */
 
 //Polar state
 struct ngt_poll_data {
@@ -715,13 +738,8 @@ static enum hrtimer_restart ngt_poll_cb(struct hrtimer *t)
 {
     struct ngt_poll_data *pd = container_of(t, struct ngt_poll_data, timer);
     struct dw_i2s_dev *dev;
-    u32 tx_data, rx_data, rx_corrected;
     u32 isr;
     int i;
-    bool exact_match, direct_match, shifted_match;
-    static u64 total_rx = 0;
-    static u64 match_count = 0;
-    static u64 nonzero_count = 0;
 
     if (unlikely(!pd || !pd->dev))
         goto out;
@@ -729,84 +747,65 @@ static enum hrtimer_restart ngt_poll_cb(struct hrtimer *t)
     dev = pd->dev;
 
     if (dev->use_pio) {
-        /* =======================================================
-         * LOOPBACK TEST WITH SHIFT CORRECTION
-         *
-         * Due to I2S protocol timing (1-bit delay after WS edge),
-         * and FPGA direct loopback, RX data is shifted right by 1 bit.
-         *
-         * At 50 MHz BCLK: RX = TX >> 1 (1-bit shift observed)
-         * At 512 kHz BCLK: RX = TX (NO shift! timing works correctly)
-         *
-         * TX Pattern: 0xD5A5D5A5
-         * Binary: 1101 0101 1010 0101 1101 0101 1010 0101
-         * ======================================================= */
+        /* TX: Send CONSTANT pattern 0xFF00FF00 */
+        u32 tx_left  = 0xFF00FF00;
+        u32 tx_right = 0x00FF00FF;
 
-        /* TX pattern for testing */
-        tx_data = 0xD5A5D5A5;  /* Original test pattern */
+        i2s_write_reg(dev->i2s_base, LRBR_LTHR(0), tx_left);
+        i2s_write_reg(dev->i2s_base, RRBR_RTHR(0), tx_right);
 
-        i2s_write_reg(dev->i2s_base, LRBR_LTHR(0), tx_data);
-        i2s_write_reg(dev->i2s_base, RRBR_RTHR(0), tx_data);
         pd->tx_cnt++;
 
-        /* Read from RX FIFO */
-        for (i = 0; i < 16; i++) {
-            isr = i2s_read_reg(dev->i2s_base, ISR(0));
+        /* RX: Read and compare */
+        for (i = 0; i < ngt_fifo_burst; i++) {
+            u32 rx_left, rx_right;
+            bool left_match, right_match;
 
+            isr = i2s_read_reg(dev->i2s_base, ISR(0));
             if (!(isr & (ISR_RXDA | ISR_RXFO)))
                 break;
 
-            rx_data = i2s_read_reg(dev->i2s_base, LRBR_LTHR(0));
-            (void)i2s_read_reg(dev->i2s_base, RRBR_RTHR(0));
+            rx_left = i2s_read_reg(dev->i2s_base, LRBR_LTHR(0));
+            rx_right = i2s_read_reg(dev->i2s_base, RRBR_RTHR(0));
 
-            total_rx++;
+            ngt_left_buffer[0] = (rx_left >> 24) & 0xFF;
+            ngt_left_buffer[1] = (rx_left >> 16) & 0xFF;
+            ngt_left_buffer[2] = (rx_left >> 8) & 0xFF;
+            ngt_left_buffer[3] = rx_left & 0xFF;
+
+            ngt_right_buffer[0] = (rx_right >> 24) & 0xFF;
+            ngt_right_buffer[1] = (rx_right >> 16) & 0xFF;
+            ngt_right_buffer[2] = (rx_right >> 8) & 0xFF;
+            ngt_right_buffer[3] = rx_right & 0xFF;
 
             if (isr & ISR_RXFO)
                 (void)i2s_read_reg(dev->i2s_base, ROR(0));
 
-            if (rx_data == 0)
-                continue;
+            pd->rx_cnt++;
+            ngt_packet_count++;
 
-            nonzero_count++;
+            left_match = (rx_left == tx_left);
+            right_match = (rx_right == tx_right);
 
-            /* Check for matches:
-             * 1. Direct match (RX == TX) - happens at slow BCLK (512 kHz)
-             * 2. Shifted match (RX << 1 == TX) - happens at fast BCLK (50 MHz)
-             */
-            rx_corrected = rx_data << 1;
-
-            direct_match = (rx_data == tx_data);
-            shifted_match = (rx_corrected == tx_data);
-            exact_match = direct_match || shifted_match;
-
-            if (exact_match)
-                match_count++;
-
-            /* Log results */
+            /* Simple output - just show what we sent vs what we got */
             if (ngt_logged_rx < ngt_log_first) {
-                const char *match_type;
-                if (direct_match)
-                    match_type = "DIRECT MATCH (no shift)";
-                else if (shifted_match)
-                    match_type = "SHIFTED MATCH (1-bit delay)";
-                else
-                    match_type = "MISMATCH";
-
-                dev_info(dev->dev,
-                    "NGT[%llu] TX=0x%08x | RX=0x%08x | %s | exact=%llu/%llu (%.0llu%%)\n",
-                    total_rx,
-                    tx_data,
-                    rx_data,
-                    match_type,
-                    match_count, nonzero_count,
-                    nonzero_count > 0 ? (match_count * 100) / nonzero_count : 0);
+                dev_info(dev->dev, "PACKET #%llu:\n", ngt_packet_count);
+                dev_info(dev->dev, "  TX_L: 0x%08x [%02x %02x %02x %02x]\n",
+                    tx_left, 0xFF, 0x00, 0xFF, 0x00);
+                dev_info(dev->dev, "  RX_L: 0x%08x [%02x %02x %02x %02x] %s\n",
+                    rx_left, ngt_left_buffer[0], ngt_left_buffer[1],
+                    ngt_left_buffer[2], ngt_left_buffer[3],
+                    left_match ? "✓" : "✗");
+                dev_info(dev->dev, "  TX_R: 0x%08x [%02x %02x %02x %02x]\n",
+                    tx_right, 0x00, 0xFF, 0x00, 0xFF);
+                dev_info(dev->dev, "  RX_R: 0x%08x [%02x %02x %02x %02x] %s\n",
+                    rx_right, ngt_right_buffer[0], ngt_right_buffer[1],
+                    ngt_right_buffer[2], ngt_right_buffer[3],
+                    right_match ? "✓" : "✗");
+                dev_info(dev->dev, "\n");
                 ngt_logged_rx++;
             }
         }
-
-        ngt_last_tx_data = tx_data;
-        ngt_last_rx_data = rx_data;
-        pd->rx_cnt = total_rx;
     }
 
     pd->polls++;
@@ -1596,11 +1595,69 @@ static int dw_i2s_probe(struct platform_device *pdev)
 	/* Optional autostart for bring-up without ALSA */
 
 	if (ngt_use_poll && ngt_autostart) {
+		/* Determine data width from CCR WSS setting */
+		u32 wss = (ngt_ccr >> 3) & 0x3;
+		u32 data_width;
+		u32 xfer_res;
+
+		switch (wss) {
+		case 0:
+			data_width = 16;
+			xfer_res = 0x02;
+			break;
+		case 1:
+			data_width = 24;
+			xfer_res = 0x04;
+			break;
+		case 2:
+		default:
+			data_width = 32;
+			xfer_res = 0x05;
+			break;
+		}
+
 		/* Hard lock expected stream settings */
 		dev->config.sample_rate = ngt_sample_rate;  /* Use module parameter */
-		dev->config.data_width  = 32;
+		dev->config.data_width  = data_width;
 		dev->config.chan_nr     = 2;
-		dev->xfer_resolution    = 0x05;
+		dev->xfer_resolution    = xfer_res;
+
+		/* ============================================================
+		 * READ CAPABILITY REGISTERS - Check for TDM support
+		 * ============================================================ */
+		{
+			u32 comp_param1, comp_param2, comp_ver;
+
+			/* Read capability registers (offsets from Synopsys databook) */
+			comp_param1 = i2s_read_reg(dev->i2s_base, 0x1F0);  /* I2S_COMP_PARAM_1 */
+			comp_param2 = i2s_read_reg(dev->i2s_base, 0x1F4);  /* I2S_COMP_PARAM_2 */
+			comp_ver = i2s_read_reg(dev->i2s_base, 0x1F8);     /* I2S_COMP_VERSION */
+
+			dev_info(dev->dev, "NGT: ============================================\n");
+			dev_info(dev->dev, "NGT: I2S CAPABILITY REGISTERS\n");
+			dev_info(dev->dev, "NGT: ============================================\n");
+			dev_info(dev->dev, "NGT: I2S_COMP_PARAM_1 (0x1F0): 0x%08x\n", comp_param1);
+			dev_info(dev->dev, "NGT: I2S_COMP_PARAM_2 (0x1F4): 0x%08x\n", comp_param2);
+			dev_info(dev->dev, "NGT: I2S_COMP_VERSION (0x1F8): 0x%08x\n", comp_ver);
+
+			/* Decode COMP_PARAM_1 bits (from Synopsys databook) */
+			dev_info(dev->dev, "NGT: Decoded capabilities:\n");
+			dev_info(dev->dev, "NGT:   TX channels: %u\n", ((comp_param1 >> 9) & 0x3) + 1);
+			dev_info(dev->dev, "NGT:   RX channels: %u\n", ((comp_param1 >> 7) & 0x3) + 1);
+			dev_info(dev->dev, "NGT:   TX word size res: %u bits\n", 12 + 4*((comp_param1 >> 5) & 0x3));
+			dev_info(dev->dev, "NGT:   RX word size res: %u bits\n", 12 + 4*((comp_param1 >> 3) & 0x3));
+			dev_info(dev->dev, "NGT:   APB data width: %u bits\n", 8 << ((comp_param1 >> 1) & 0x3));
+			dev_info(dev->dev, "NGT:   Mode: %s\n", (comp_param1 & 0x1) ? "TX+RX" : "TX or RX only");
+			dev_info(dev->dev, "NGT: ============================================\n");
+
+			/* Also read some potentially undocumented registers */
+			dev_info(dev->dev, "NGT: Checking additional registers...\n");
+			dev_info(dev->dev, "NGT:   Reg 0x040: 0x%08x\n", i2s_read_reg(dev->i2s_base, 0x040));
+			dev_info(dev->dev, "NGT:   Reg 0x044: 0x%08x\n", i2s_read_reg(dev->i2s_base, 0x044));
+			dev_info(dev->dev, "NGT:   Reg 0x048: 0x%08x\n", i2s_read_reg(dev->i2s_base, 0x048));
+			dev_info(dev->dev, "NGT:   Reg 0x04C: 0x%08x\n", i2s_read_reg(dev->i2s_base, 0x04C));
+			dev_info(dev->dev, "NGT:   Reg 0x050: 0x%08x\n", i2s_read_reg(dev->i2s_base, 0x050));
+		}
 
 		/* ---- clean stop before touching FIFOs/config ---- */
 		i2s_write_reg(dev->i2s_base, CER, 0);
@@ -1616,29 +1673,84 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		dw_i2s_config(dev, SNDRV_PCM_STREAM_PLAYBACK);
 		dw_i2s_config(dev, SNDRV_PCM_STREAM_CAPTURE);
 
-		/* Force 32-bit width at the controller (redundant but explicit) */
-		i2s_write_reg(dev->i2s_base, TCR(0), 0x05);
-		i2s_write_reg(dev->i2s_base, RCR(0), 0x05);
+		/* Set TCR/RCR based on CCR WSS (word size)
+		 * TCR/RCR WLEN values:
+		 *   0x02 = 16-bit resolution
+		 *   0x04 = 24-bit resolution
+		 *   0x05 = 32-bit resolution
+		 */
+		{
+			u32 wss = (ngt_ccr >> 3) & 0x3;
+			u32 tcr_rcr_val;
+
+			switch (wss) {
+			case 0:
+				tcr_rcr_val = 0x02;  /* 16-bit */
+				break;
+			case 1:
+				tcr_rcr_val = 0x04;  /* 24-bit */
+				break;
+			case 2:
+			default:
+				tcr_rcr_val = 0x05;  /* 32-bit */
+				break;
+			}
+
+			i2s_write_reg(dev->i2s_base, TCR(0), tcr_rcr_val);
+			i2s_write_reg(dev->i2s_base, RCR(0), tcr_rcr_val);
+			dev_info(dev->dev, "NGT: TCR/RCR set to 0x%02x (WSS=%u)\n", tcr_rcr_val, wss);
+		}
 		i2s_write_reg(dev->i2s_base, RFCR(0), 0x07); // Trigger FIFO on both channels
 
 		/* ============================================================
-		 * CRITICAL: Set the actual BCLK clock rate!
-		 * BCLK = sample_rate * bits_per_channel * channels
-		 * BCLK = sample_rate * 32 * 2 = sample_rate * 64
+		 * CLOCK CONFIGURATION
 		 *
-		 * For slow BCLK demonstration:
-		 *   ngt_sample_rate=100  -> BCLK = 6.4 kHz (easy to see on scope)
-		 *   ngt_sample_rate=1000 -> BCLK = 64 kHz
-		 *   ngt_sample_rate=8000 -> BCLK = 512 kHz (default)
+		 * HARDWARE LIMITATION WARNING:
+		 * The DesignWare I2S IP can only toggle LRCLK every 16, 24, or 32 bits.
+		 * It CANNOT toggle LRCLK every 128 bits (16 bytes per channel).
+		 *
+		 * Standard I2S: BCLK = sample_rate * 64 (32 bits per channel)
 		 * ============================================================ */
 		{
-			u32 target_bclk = ngt_sample_rate * 64;  /* 32-bit stereo */
+			/* Calculate frame size based on CCR WSS setting */
+			u32 wss = (ngt_ccr >> 3) & 0x3;
+			u32 bits_per_channel;
+			u32 frame_bits;
+			u32 target_bclk;
 			int clk_ret;
 			unsigned long rate_before, rate_after, rounded_rate;
 
-			dev_info(dev->dev, "NGT: ========== CLOCK CONFIGURATION ==========\n");
-			dev_info(dev->dev, "NGT: Target sample_rate = %u Hz\n", ngt_sample_rate);
-			dev_info(dev->dev, "NGT: Target BCLK = %u Hz (sample_rate * 64)\n", target_bclk);
+			/* Decode WSS (Word Select Size) */
+			switch (wss) {
+			case 0:
+				bits_per_channel = 16;  /* 16 SCLK cycles per channel */
+				break;
+			case 1:
+				bits_per_channel = 24;  /* 24 SCLK cycles per channel */
+				break;
+			case 2:
+			default:
+				bits_per_channel = 32;  /* 32 SCLK cycles per channel */
+				break;
+			}
+
+			frame_bits = bits_per_channel * 2;  /* 2 channels (L + R) */
+			target_bclk = ngt_sample_rate * frame_bits;
+
+			dev_info(dev->dev, "NGT: ========================================\n");
+			dev_info(dev->dev, "NGT: CLOCK CONFIGURATION\n");
+			dev_info(dev->dev, "NGT: ========================================\n");
+			dev_info(dev->dev, "NGT: CCR = 0x%02x (WSS = %u)\n", ngt_ccr, wss);
+			dev_info(dev->dev, "NGT: Bits per channel: %u\n", bits_per_channel);
+			dev_info(dev->dev, "NGT: Frame size: %u bits (%uL + %uR)\n",
+				frame_bits, bits_per_channel, bits_per_channel);
+			dev_info(dev->dev, "NGT: Sample Rate (LRCLK): %u Hz\n", ngt_sample_rate);
+			dev_info(dev->dev, "NGT: Target BCLK: %u Hz\n", target_bclk);
+			dev_info(dev->dev, "NGT: ----------------------------------------\n");
+			dev_info(dev->dev, "NGT: Formula: BCLK = LRCLK x %u\n", frame_bits);
+			dev_info(dev->dev, "NGT:          %u = %u x %u\n",
+				target_bclk, ngt_sample_rate, frame_bits);
+			dev_info(dev->dev, "NGT: ========================================\n");
 
 			if (dev->clk) {
 				/* Get current rate before any changes */
@@ -1754,21 +1866,46 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		hrtimer_start(&ngt_pd->timer, ngt_pd->period, HRTIMER_MODE_REL_PINNED);
 		dev_info(dev->dev, "NGT: autostart done, polling started (%u us)\n", ngt_poll_us);
 
-		/* Print detailed configuration for debugging */
+		/* Print final configuration summary */
 		{
-			u32 frame_bits = 32 * 2;  /* 32 bits x 2 channels = 64 bits per frame */
+			u32 wss = (ngt_ccr >> 3) & 0x3;
+			u32 bits_per_ch = (wss == 0) ? 16 : (wss == 1) ? 24 : 32;
+			u32 frame_bits = bits_per_ch * 2;
 			u32 bclk_hz = ngt_sample_rate * frame_bits;
+			u32 bytes_per_ch = bits_per_ch / 8;
+			u32 data_rate_kbps = (ngt_sample_rate * bytes_per_ch * 2 * 8) / 1000;
+
 			dev_info(dev->dev, "NGT: ============================================\n");
-			dev_info(dev->dev, "NGT: I2S Configuration:\n");
-			dev_info(dev->dev, "NGT:   Sample Rate: %u Hz\n", ngt_sample_rate);
-			dev_info(dev->dev, "NGT:   Data Width:  32 bits per channel\n");
-			dev_info(dev->dev, "NGT:   Channels:    2 (stereo)\n");
-			dev_info(dev->dev, "NGT:   Frame Size:  64 bits (32L + 32R)\n");
-			dev_info(dev->dev, "NGT:   Frame Size:  8 bytes (4 LEFT + 4 RIGHT)\n");
-			dev_info(dev->dev, "NGT:   BCLK:        %u Hz (%u kHz)\n", bclk_hz, bclk_hz/1000);
-			dev_info(dev->dev, "NGT:   CCR:         0x%02x (WSS=%d)\n", ngt_ccr, (ngt_ccr >> 3) & 0x3);
-			dev_info(dev->dev, "NGT:   Frame Offset: %u (%s)\n", ngt_frame_offset,
-				ngt_frame_offset == 0 ? "Left-Justified" : "Standard I2S");
+			dev_info(dev->dev, "NGT: 8-BYTE PER CYCLE CONFIGURATION\n");
+			dev_info(dev->dev, "NGT: ============================================\n");
+			dev_info(dev->dev, "NGT: CCR:          0x%02x (WSS=%u)\n", ngt_ccr, wss);
+			dev_info(dev->dev, "NGT: Bits/Channel: %u bits\n", bits_per_ch);
+			dev_info(dev->dev, "NGT: Frame:        %u bits (%uL + %uR)\n", frame_bits, bits_per_ch, bits_per_ch);
+			dev_info(dev->dev, "NGT: LRCLK/FSYNC:  %u Hz on GPIO19\n", ngt_sample_rate);
+			dev_info(dev->dev, "NGT: BCLK:         %u Hz on GPIO18\n", bclk_hz);
+			dev_info(dev->dev, "NGT: BCLK/FSYNC:   %u (ratio)\n", frame_bits);
+			dev_info(dev->dev, "NGT: ----------------------------------------\n");
+			dev_info(dev->dev, "NGT: Per FSYNC Cycle:\n");
+			dev_info(dev->dev, "NGT:   Left:  %u bytes (%u bits)\n", bytes_per_ch, bits_per_ch);
+			dev_info(dev->dev, "NGT:   Right: %u bytes (%u bits)\n", bytes_per_ch, bits_per_ch);
+			dev_info(dev->dev, "NGT:   TOTAL: %u bytes per cycle\n", bytes_per_ch * 2);
+			dev_info(dev->dev, "NGT: ----------------------------------------\n");
+			dev_info(dev->dev, "NGT: Data Rate: %u kbps (%u bytes/sec)\n",
+				data_rate_kbps, ngt_sample_rate * bytes_per_ch * 2);
+			dev_info(dev->dev, "NGT: ============================================\n");
+
+			/* Show what this configuration achieves */
+			if (wss == 2 && ngt_sample_rate == 32000) {
+				dev_info(dev->dev, "NGT: ✓ E1 TELEPHONY STANDARD\n");
+				dev_info(dev->dev, "NGT: ✓ 32kHz FSYNC x 64-bit frame = 2.048 MHz BCLK\n");
+				dev_info(dev->dev, "NGT: ✓ 8 bytes per FSYNC cycle (4L + 4R)\n");
+				dev_info(dev->dev, "NGT: ✓ 256 kbps data rate\n");
+			} else if (wss == 2 && ngt_sample_rate == 48000) {
+				dev_info(dev->dev, "NGT: ✓ HIGH QUALITY AUDIO\n");
+				dev_info(dev->dev, "NGT: ✓ 48kHz FSYNC x 64-bit frame = 3.072 MHz BCLK\n");
+				dev_info(dev->dev, "NGT: ✓ 8 bytes per FSYNC cycle (4L + 4R)\n");
+				dev_info(dev->dev, "NGT: ✓ 384 kbps data rate\n");
+			}
 			dev_info(dev->dev, "NGT: ============================================\n");
 		}
 	}
